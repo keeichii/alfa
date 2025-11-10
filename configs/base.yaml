@@ -1,0 +1,17 @@
+data:
+  raw_questions: data/raw/questions_clean.csv
+  raw_websites: data/raw/websites_updated.csv
+  corpus_jsonl: data/processed/corpus.jsonl
+  chunks_jsonl: data/processed/chunks.jsonl
+indexes:
+  faiss_dir: indexes/faiss
+  bm25_dir: indexes/bm25
+retrieval:
+  k_retrieve: 50
+  k_final: 5
+  hybrid_weight_dense: 0.6
+  hybrid_weight_bm25: 0.4
+chunking:
+  size_tokens: 600
+  overlap_tokens: 150
+  add_title_prefix: true
