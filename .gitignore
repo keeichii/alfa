@@ -1,13 +1,70 @@
-# venv / conda
-.venv/
-env/
-venv/
-
-# data & indexes & outputs
-#data/
-#indexes/
-#outputs/
-
-# python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data files (too large for git)
+data/processed/*.jsonl
+data/raw/*.csv
+
+# Indexes (too large for git)
+indexes/faiss/*
+indexes/bm25/*
+
+# Outputs (generated files)
+outputs/submits/*
+outputs/reports/*
+outputs/logs/*
+
+# FlashRAG (external library, should be installed separately)
+FlashRAG/
+
+# Temporary files
+*.tmp
+*.log
+*.cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files (downloaded automatically)
+*.bin
+*.safetensors
+*.onnx
+
+# Keep directory structure but ignore contents
+!data/processed/.gitkeep
+!data/raw/.gitkeep
+!indexes/faiss/.gitkeep
+!indexes/bm25/.gitkeep
+!outputs/submits/.gitkeep
+!outputs/reports/.gitkeep
+!outputs/logs/.gitkeep

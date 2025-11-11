@@ -1,26 +1,57 @@
-import argparse, csv, json, pathlib, sys
+#!/usr/bin/env python3
+"""
+Build corpus JSONL from websites CSV.
 
-# Поднять лимит поля (по умолчанию 131072 байт ≈ 128 КБ)
-limit = sys.maxsize
-while True:
-    try:
-        csv.field_size_limit(limit)
-        break
-    except OverflowError:
-        limit = limit // 10
+Usage:
+    python scripts/build_corpus.py --config configs/base.yaml
+    python scripts/build_corpus.py --input data/raw/websites_updated.csv --output data/processed/corpus.jsonl
+"""
+import argparse
+import sys
+from pathlib import Path
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--in", dest="inp", required=True)
-ap.add_argument("--out", dest="out", required=True)
-a = ap.parse_args()
-out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
-with open(a.inp, newline="", encoding="utf-8") as f_in, open(out, "w", encoding="utf-8") as f_out:
-    r = csv.DictReader(f_in)
-    for row in r:
-        web_id = str(row.get("web_id","")).strip()
-        title = (row.get("title") or "").strip()
-        text  = (row.get("text") or "").strip()
-        contents = (title + "\n" + text).strip()
-        if not web_id or not contents: continue
-        f_out.write(json.dumps({"id": web_id, "contents": contents}, ensure_ascii=False) + "\n")
-print("Wrote corpus.jsonl")
+# add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+import yaml
+from src.ingest import build_corpus
+
+
+def load_config(config_path: str) -> dict:
+    """Load YAML configuration file."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build corpus JSONL from websites CSV")
+    parser.add_argument(
+        "--config",
+        help="Path to YAML config file (if provided, uses paths from config)"
+    )
+    parser.add_argument(
+        "--input",
+        help="Path to websites_updated.csv (overrides config)"
+    )
+    parser.add_argument(
+        "--output",
+        help="Path to output corpus.jsonl (overrides config)"
+    )
+    args = parser.parse_args()
+    
+    if args.config:
+        config = load_config(args.config)
+        input_csv = args.input or config["data"]["raw_websites"]
+        output_jsonl = args.output or config["data"]["corpus_jsonl"]
+    else:
+        if not args.input or not args.output:
+            parser.error("Either --config or both --input and --output must be provided")
+        input_csv = args.input
+        output_jsonl = args.output
+    
+    build_corpus(input_csv, output_jsonl)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,17 +1,38 @@
+# Base configuration for RAG pipeline
+
 data:
   raw_questions: data/raw/questions_clean.csv
   raw_websites: data/raw/websites_updated.csv
   corpus_jsonl: data/processed/corpus.jsonl
   chunks_jsonl: data/processed/chunks.jsonl
+
 indexes:
   faiss_dir: indexes/faiss
   bm25_dir: indexes/bm25
+
+outputs:
+  submits_dir: outputs/submits
+  reports_dir: outputs/reports
+  logs_dir: outputs/logs
+
 retrieval:
-  k_retrieve: 50
-  k_final: 5
-  hybrid_weight_dense: 0.6
-  hybrid_weight_bm25: 0.4
+  k_retrieve: 50  # retrieve top-k candidates before reranking
+  k_final: 5  # final top-k for submission
+  hybrid_weight_dense: 0.6  # weight for dense vector similarity
+  hybrid_weight_bm25: 0.4  # weight for BM25 score
+  use_reranker: true  # enable/disable reranking
+  fusion_method: "weighted"  # "weighted" or "rrf" (Reciprocal Rank Fusion)
+  enhance_numerics: true  # enhance queries for numeric value matching
+
 chunking:
   size_tokens: 600
   overlap_tokens: 150
   add_title_prefix: true
+  tokenizer: "o200k_base"  # tokenizer for chunking
+  merge_short_paragraphs: true  # merge short paragraphs before chunking
+  min_paragraph_length: 50  # minimum characters for standalone paragraph
+  use_semantic_chunking: true  # use semantic-structural chunking (tables, headings)
+
+evaluation:
+  metrics: ["hit@5", "recall@5", "recall@10", "mrr", "ndcg@5"]
+  save_candidate_logs: true  # save retrieval candidates for analysis
