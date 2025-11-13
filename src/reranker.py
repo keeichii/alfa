@@ -7,7 +7,12 @@ try:
 except ImportError:
     raise ImportError("sentence-transformers is required for reranking")
 
-from src.utils import logger
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
+from src.utils import logger, supports_fp16
 
 
 class Reranker:
@@ -24,7 +29,8 @@ class Reranker:
         model_name: str,
         device: str = "cpu",
         batch_size: int = 16,
-        max_length: int = 512
+        max_length: int = 512,
+        use_fp16: bool = False,
     ):
         """
         Initialize reranker.
@@ -36,9 +42,18 @@ class Reranker:
             max_length: Maximum sequence length
         """
         logger.info(f"Loading reranker model: {model_name}")
+        self.device = device
         self.model = CrossEncoder(model_name, device=device, max_length=max_length)
         self.batch_size = batch_size
-        logger.info(f"Reranker initialized on {device}")
+        self.use_fp16 = use_fp16 and supports_fp16(device)
+        if self.use_fp16 and torch is not None:
+            try:
+                self.model.model.half()  # type: ignore[attr-defined]
+                logger.info("Reranker weights converted to fp16")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Failed to convert reranker to fp16: %s", exc)
+                self.use_fp16 = False
+        logger.info(f"Reranker initialized on {device} (fp16={self.use_fp16})")
     
     def rerank(
         self,

@@ -6,6 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -58,4 +63,44 @@ def validate_chunk_format(chunk: Dict[str, Any]) -> bool:
     """Validate that chunk has required fields."""
     required = ["id", "contents"]
     return all(field in chunk for field in required) and isinstance(chunk["contents"], str)
+
+
+def resolve_device(preferred: Optional[str] = None, fallback: str = "cpu") -> str:
+    """
+    Resolve the best available device given a user preference.
+
+    - "auto": pick CUDA if available, else CPU.
+    - "cuda" or "cuda:{id}": verify CUDA availability, otherwise fall back.
+    - "cpu": always CPU.
+    """
+    pref = (preferred or "auto").lower()
+    if pref in {"cpu", "cpu:0"}:
+        return "cpu"
+
+    if pref == "auto":
+        if torch is not None and torch.cuda.is_available():
+            return "cuda"
+        return fallback
+
+    if pref.startswith("cuda"):
+        if torch is not None and torch.cuda.is_available():
+            device_parts = pref.split(":", 1)
+            if len(device_parts) == 2:
+                try:
+                    idx = int(device_parts[1])
+                    if idx < torch.cuda.device_count():
+                        return f"cuda:{idx}"
+                except ValueError:
+                    logger.warning("Invalid CUDA device index %s, defaulting to cuda", device_parts[1])
+            return "cuda"
+        logger.warning("CUDA requested but not available; falling back to %s", fallback)
+        return fallback
+
+    # default fallback
+    return fallback
+
+
+def supports_fp16(device: str) -> bool:
+    """Return True if the runtime supports fp16 on the specified device."""
+    return torch is not None and device.startswith("cuda")
 

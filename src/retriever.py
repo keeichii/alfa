@@ -19,7 +19,10 @@ try:
     import faiss  # type: ignore
 except Exception:
     faiss = None  # lazy-require if dense enabled
-from typing import TypedDict
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 from sentence_transformers import SentenceTransformer
 
 try:  # optional dependency used for convenience conversions
@@ -28,7 +31,7 @@ except Exception:  # pragma: no cover - numpy should be available but guard just
     np = None  # type: ignore
 
 from src.table_processor import enhance_query_for_numerics
-from src.utils import logger, load_jsonl
+from src.utils import logger, load_jsonl, supports_fp16
 
 
 class FlashRAGBM25Retriever:
@@ -273,31 +276,53 @@ class HybridRetriever:
         weight_bm25: float = 0.4,
         fusion_method: str = "weighted",  # "weighted" or "rrf"
         enhance_numerics: bool = True,
+        embedding_fp16: bool = False,
+        faiss_use_gpu: bool = False,
+        faiss_gpu_device: Optional[int] = None,
+        faiss_use_fp16: bool = False,
     ) -> None:
         if faiss is None:
             raise ImportError("faiss is required for dense retrieval. Install faiss-cpu or faiss-gpu.")
 
+        self.device = device
         self.weight_dense = float(weight_dense)
         self.weight_bm25 = float(weight_bm25)
         self.fusion_method = fusion_method
         self.normalize_embeddings = normalize_embeddings
         self.query_batch_size = max(1, int(query_batch_size))
         self.enhance_numerics = enhance_numerics
+        self.embedding_use_fp16 = embedding_fp16 and supports_fp16(device)
+        self.faiss_use_gpu = faiss_use_gpu and device.startswith("cuda")
+        self.faiss_gpu_device = faiss_gpu_device
+        self.faiss_use_fp16 = faiss_use_fp16 and supports_fp16(device)
+        self._faiss_gpu_resources = None
 
         # Dense setup
         logger.info(f"Loading FAISS index from {faiss_index_path}")
         self.faiss_index = faiss.read_index(faiss_index_path)
+        if self.faiss_use_gpu:
+            self._move_faiss_to_gpu()
+
         self.embedding_model = SentenceTransformer(embedding_model_name, device=device)
+        if self.embedding_use_fp16:
+            self._enable_embedding_fp16()
 
         self.chunk_ids: List[str] = []
         self.doc_ids: List[Optional[str]] = []
         if faiss_meta_path and Path(faiss_meta_path).exists():
             with open(faiss_meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            self.chunk_ids = meta.get("chunk_ids", [])
-            self.doc_ids = meta.get("doc_ids", [])
+            self.chunk_ids = [str(cid) for cid in meta.get("chunk_ids", [])]
+            self.doc_ids = [str(did) if did is not None else None for did in meta.get("doc_ids", [])]
         else:
             logger.warning("FAISS metadata missing; dense results will use fallback ids")
+
+        self._chunk_id_to_dense_idx = {cid: idx for idx, cid in enumerate(self.chunk_ids)} if self.chunk_ids else {}
+        self._doc_id_to_dense_idx = {}
+        if self.doc_ids:
+            for idx, doc_id in enumerate(self.doc_ids):
+                if doc_id is not None:
+                    self._doc_id_to_dense_idx.setdefault(str(doc_id), idx)
 
         # Sparse setup (FlashRAG bm25s)
         self.bm25 = FlashRAGBM25Retriever(
@@ -307,6 +332,61 @@ class HybridRetriever:
             enhance_numerics=enhance_numerics,
         )
         self._corpus = self.bm25._corpus
+
+        if not self.chunk_ids and self._corpus:
+            self.chunk_ids = [str(chunk.get("id", idx)) for idx, chunk in enumerate(self._corpus)]
+            self.doc_ids = [str(chunk.get("doc_id", chunk.get("id", idx))) for idx, chunk in enumerate(self._corpus)]
+            self._chunk_id_to_dense_idx = {cid: idx for idx, cid in enumerate(self.chunk_ids)}
+            for idx, doc_id in enumerate(self.doc_ids):
+                self._doc_id_to_dense_idx.setdefault(str(doc_id), idx)
+
+    def _move_faiss_to_gpu(self) -> None:
+        """Optionally move FAISS index to GPU for faster search."""
+        if faiss is None:
+            return
+        if not self.faiss_use_gpu:
+            return
+        try:
+            gpu_id = self.faiss_gpu_device
+            if gpu_id is None:
+                gpu_id = torch.cuda.current_device() if (torch is not None and torch.cuda.is_available()) else 0
+            elif torch is not None and gpu_id >= torch.cuda.device_count():
+                logger.warning(
+                    "Requested FAISS GPU device %s unavailable (device_count=%s); defaulting to 0",
+                    gpu_id,
+                    torch.cuda.device_count() if torch else "unknown",
+                )
+                gpu_id = 0
+            res = faiss.StandardGpuResources()
+            options = faiss.GpuClonerOptions()
+            options.useFloat16 = self.faiss_use_fp16
+            self.faiss_index = faiss.index_cpu_to_gpu(res, int(gpu_id), self.faiss_index, options)
+            self._faiss_gpu_resources = res
+            logger.info("FAISS index moved to GPU:%s (fp16=%s)", gpu_id, self.faiss_use_fp16)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to move FAISS index to GPU: %s. Falling back to CPU.", exc)
+            self.faiss_use_gpu = False
+
+    def _enable_embedding_fp16(self) -> None:
+        """Enable fp16 for embeddings when supported."""
+        if not supports_fp16(self.device):
+            self.embedding_use_fp16 = False
+            return
+        if torch is None:
+            self.embedding_use_fp16 = False
+            return
+        try:
+            torch_device = torch.device(self.device)
+            self.embedding_model = self.embedding_model.to(torch_device)
+            first_module = self.embedding_model._first_module()
+            if hasattr(first_module, "auto_model"):
+                first_module.auto_model = first_module.auto_model.half()
+            elif hasattr(first_module, "half"):
+                first_module = first_module.half()
+            logger.info("Embedding model converted to fp16 on %s", self.device)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to enable fp16 embeddings: %s", exc)
+            self.embedding_use_fp16 = False
 
     def _encode(self, queries: List[str]) -> "np.ndarray":
         emb = self.embedding_model.encode(
@@ -412,21 +492,10 @@ class HybridRetriever:
             bm25_dense_vals: List[float] = []
             for cand in bm25_cands:
                 chunk_id = cand.get("chunk_id")
-                # try to map chunk_id into dense idx via chunk_ids if present, else fallback to doc alignment
-                idx = None
-                if self.chunk_ids:
-                    try:
-                        idx = self.chunk_ids.index(chunk_id)
-                    except ValueError:
-                        idx = None
+                idx = self._chunk_id_to_dense_idx.get(str(chunk_id))
                 if idx is None:
-                    # fallback: try doc_id approximate mapping by first occurrence
                     doc_id = str(cand.get("doc_id"))
-                    if self.doc_ids:
-                        try:
-                            idx = next(i for i, did in enumerate(self.doc_ids) if str(did) == doc_id)
-                        except StopIteration:
-                            idx = None
+                    idx = self._doc_id_to_dense_idx.get(doc_id)
                 if idx is not None:
                     bm25_dense_idxs.append(idx)
                     bm25_dense_vals.append(float(cand.get("bm25_score", 0.0)))

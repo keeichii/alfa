@@ -17,6 +17,8 @@ sys.path.insert(0, str(project_root / "FlashRAG"))
 import yaml
 from flashrag.retriever.index_builder import Index_Builder
 
+from src.utils import load_jsonl, resolve_device
+
 
 def load_config(config_path: str) -> dict:
     """Load YAML configuration file."""
@@ -44,6 +46,9 @@ def main():
     # get model config
     embeddings_config = models_config["embeddings"]
     faiss_config = models_config["faiss"]
+    embedding_device = resolve_device(embeddings_config.get("device", "auto"))
+    use_fp16 = embeddings_config.get("use_fp16", False) and embedding_device.startswith("cuda")
+    faiss_gpu_enabled = faiss_config.get("use_gpu", False) and embedding_device.startswith("cuda")
     
     print(f"Building FAISS index...")
     print(f"  Corpus: {corpus_path}")
@@ -59,11 +64,11 @@ def main():
         save_dir=save_dir,
         max_length=512,
         batch_size=embeddings_config.get("batch_size", 32),
-        use_fp16=False,  # safer for CPU
+        use_fp16=use_fp16,
         pooling_method=None,  # auto-detect
         instruction=None,  # auto-detect for E5/BGE
         faiss_type=faiss_config["index_type"],
-        faiss_gpu=(embeddings_config["device"] == "cuda"),
+        faiss_gpu=faiss_gpu_enabled,
         use_sentence_transformer=True,  # use sentence-transformers for easier setup
         bm25_backend="bm25s"
     )
@@ -73,7 +78,6 @@ def main():
     
     # save metadata (chunk_ids, doc_ids mapping)
     # load chunks to extract doc_ids
-    from src.utils import load_jsonl
     chunks = load_jsonl(corpus_path)
     
     # extract doc_ids from chunks (web_id)

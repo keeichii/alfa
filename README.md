@@ -26,7 +26,7 @@ alfa/
 │   ├── semantic_chunker.py  # Семантико-структурное чанкование
 │   ├── table_processor.py  # Обработка таблиц и числовых значений
 │   ├── text_processor.py   # Нормализация текста
-│   ├── retriever.py      # FlashRAG BM25s ретривер
+│   ├── retriever.py      # Гибридный ретривер (FAISS + FlashRAG bm25s)
 │   ├── reranker.py       # Cross-encoder реранкер
 │   ├── evaluator.py      # Метрики оценки
 │   ├── failure_logger.py # Логирование провалов
@@ -34,7 +34,7 @@ alfa/
 ├── requirements.txt      # Зависимости Python
 ├── Makefile             # Команды для сборки
 ├── README.md            # Этот файл
-└── data.md              # Подробное описание системы
+└── about.md             # Подробное описание системы
 ```
 
 ## Быстрый запуск
@@ -43,7 +43,11 @@ alfa/
 
 ```bash
 # 1. Установка Python пакетов
+# 1. Установка Python пакетов (faiss-cpu по умолчанию)
 pip install -r requirements.txt
+
+# 1a. Для GPU: установите faiss-gpu и torch с поддержкой CUDA
+pip install faiss-gpu torch --extra-index-url https://download.pytorch.org/whl/cu121
 
 # 2. Установка FlashRAG
 cd FlashRAG
@@ -61,7 +65,7 @@ make build_corpus    # CSV → corpus.jsonl
 make chunk_corpus     # corpus.jsonl → chunks.jsonl
 
 # Построение индекса
-make build_index      # BM25 (bm25s) индекс через FlashRAG
+make build_index      # FAISS + BM25 (bm25s) индексы через FlashRAG
 
 # Оценка и генерация submit
 make eval             # Ретрив + реранк + метрики
@@ -79,7 +83,7 @@ make build_corpus chunk_corpus build_index eval submit
 
 - **Python 3.10+**
 - **FlashRAG** — построение BM25 индексов и инфраструктура RAG
-- **sentence-transformers** — CrossEncoder для реранка
+- **sentence-transformers** — эмбеддинги и CrossEncoder для реранка
 - **bm25s** — быстрый BM25-поиск
 - **chonkie** — токенизация и чанкинг
 - **PyYAML** — конфигурации
@@ -129,15 +133,26 @@ chunking:
 
 - ✅ Семантико-структурное чанкование (таблицы, заголовки)
 - ✅ Обработка числовых значений (валюты, проценты, курсы)
-- ✅ FlashRAG BM25s ретривер + CrossEncoder реранкер
+- ✅ Гибридный ретривер: FAISS dense + FlashRAG bm25s (weighted / RRF fusion)
 - ✅ Батчевая обработка запросов (retrieval + rerank)
-- ✅ Cross-encoder реранкинг
+- ✅ Cross-encoder реранкинг (fp16 на GPU)
 - ✅ Детальное логирование провалов для анализа
 - ✅ Полная воспроизводимость (конфиги, версии)
+- ✅ Автонастройка GPU (CUDA) для эмбеддингов, ретривера и реранкера
+
+## GPU / CUDA
+
+- Установите `torch` и `faiss-gpu` с соответствующим CUDA билдом (пример для CUDA 12.1 выше).
+- В `configs/models.yaml` оставьте `"device: auto"` — пайплайн сам выберет `cuda`, если она доступна.
+- Дополнительно:
+  - `embeddings.use_fp16: true` включает half precision для SentenceTransformer.
+  - `faiss.use_gpu: true` переносит FAISS индекс на GPU и включает fp16 (если доступно).
+  - `reranker.use_fp16: true` ускоряет cross-encoder на GPU.
+- Профилируйте производительность с `python scripts/benchmark.py --config configs/base.yaml --n 100`.
 
 ## Документация
 
-Подробное описание системы, алгоритмов и компонентов см. в **[data.md](data.md)**.
+Подробное описание системы, алгоритмов и компонентов см. в **[about.md](about.md)**.
 
 ## Лицензия
 

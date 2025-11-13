@@ -22,7 +22,7 @@ from src.retriever import HybridRetriever
 from src.reranker import Reranker
 from src.evaluator import RetrievalEvaluator
 from src.failure_logger import FailureLogger
-from src.utils import logger, get_timestamp
+from src.utils import logger, get_timestamp, resolve_device
 
 
 def load_config(config_path: str) -> dict:
@@ -69,6 +69,7 @@ def main():
     use_reranker = retrieval_config.get("use_reranker", True)
     
     reranker_config = models_config["reranker"]
+    faiss_config = models_config.get("faiss", {})
     bm25_corpus_override = retrieval_config.get("bm25_corpus_path")
     
     # read questions
@@ -90,29 +91,36 @@ def main():
 
     bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
     embeddings_config = models_config["embeddings"]
+    embedding_device = resolve_device(embeddings_config.get("device", "auto"))
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
         faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
         bm25_index_dir=bm25_dir,
         bm25_corpus_path=bm25_corpus_path,
         embedding_model_name=embeddings_config["model_name"],
-        device=embeddings_config["device"],
+        device=embedding_device,
         normalize_embeddings=embeddings_config.get("normalize_embeddings", True),
         query_batch_size=retrieval_config.get("batch_size", embeddings_config.get("batch_size", 32)),
         weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
         weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
         fusion_method=retrieval_config.get("fusion_method", "weighted"),
         enhance_numerics=retrieval_config.get("enhance_numerics", True),
+        embedding_fp16=embeddings_config.get("use_fp16", False),
+        faiss_use_gpu=faiss_config.get("use_gpu", False),
+        faiss_gpu_device=faiss_config.get("gpu_device"),
+        faiss_use_fp16=faiss_config.get("use_float16", False),
     )
     
     # initialize reranker if enabled
     reranker = None
     if use_reranker:
         logger.info("Initializing reranker...")
+        reranker_device = resolve_device(reranker_config.get("device", "auto"))
         reranker = Reranker(
             model_name=reranker_config["model_name"],
-            device=reranker_config["device"],
-            batch_size=reranker_config["batch_size"]
+            device=reranker_device,
+            batch_size=reranker_config.get("batch_size", 16),
+            use_fp16=reranker_config.get("use_fp16", False),
         )
     
     # initialize evaluator
