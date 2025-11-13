@@ -26,7 +26,7 @@ alfa/
 │   ├── semantic_chunker.py  # Семантико-структурное чанкование
 │   ├── table_processor.py  # Обработка таблиц и числовых значений
 │   ├── text_processor.py   # Нормализация текста
-│   ├── retriever.py      # Гибридный ретривер (FAISS + BM25)
+│   ├── retriever.py      # FlashRAG BM25s ретривер
 │   ├── reranker.py       # Cross-encoder реранкер
 │   ├── evaluator.py      # Метрики оценки
 │   ├── failure_logger.py # Логирование провалов
@@ -51,9 +51,6 @@ pip install -e .
 pip install flashrag-dev[full]
 cd ..
 
-# 3. Установка FAISS
-conda install -c pytorch faiss-cpu=1.8.0
-# или для GPU: conda install -c pytorch -c nvidia faiss-gpu=1.8.0
 ```
 
 ### Запуск полного пайплайна
@@ -63,8 +60,8 @@ conda install -c pytorch faiss-cpu=1.8.0
 make build_corpus    # CSV → corpus.jsonl
 make chunk_corpus     # corpus.jsonl → chunks.jsonl
 
-# Построение индексов
-make build_index      # FAISS + BM25 индексы
+# Построение индекса
+make build_index      # BM25 (bm25s) индекс через FlashRAG
 
 # Оценка и генерация submit
 make eval             # Ретрив + реранк + метрики
@@ -81,17 +78,15 @@ make build_corpus chunk_corpus build_index eval submit
 ### Основные библиотеки
 
 - **Python 3.10+**
-- **FlashRAG** — построение индексов и компоненты RAG
-- **sentence-transformers** — эмбеддинги (E5, mpnet)
-- **faiss-cpu/faiss-gpu** — векторный поиск
-- **bm25s** — разреженный поиск BM25
+- **FlashRAG** — построение BM25 индексов и инфраструктура RAG
+- **sentence-transformers** — CrossEncoder для реранка
+- **bm25s** — быстрый BM25-поиск
 - **chonkie** — токенизация и чанкинг
 - **PyYAML** — конфигурации
 - **numpy, scikit-learn** — вычисления и метрики
 
 ### Модели
 
-- **Embeddings:** `intfloat/multilingual-e5-base` (настраивается)
 - **Reranker:** `cross-encoder/ms-marco-MiniLM-L-12-v2` (настраивается)
 - **Tokenizer:** `o200k_base` для чанкинга
 
@@ -101,12 +96,14 @@ make build_corpus chunk_corpus build_index eval submit
 
 ```yaml
 retrieval:
-  k_retrieve: 50           # кандидатов до реранка
-  k_final: 5               # финальный топ-K
-  hybrid_weight_dense: 0.6 # вес dense поиска
+  k_retrieve: 30            # кандидатов на первом этапе
+  k_rerank: 20              # кандидатов, передаваемых в cross-encoder
+  k_final: 5                # финальный топ-K
+  batch_size: 32            # размер батча вопросов
+  hybrid_weight_dense: 0.6  # вес dense поиска
   hybrid_weight_bm25: 0.4   # вес BM25 поиска
   fusion_method: "weighted" # или "rrf"
-  enhance_numerics: true # улучшение для числовых значений
+  enhance_numerics: true    # улучшение для числовых значений при BM25
 
 chunking:
   size_tokens: 600
@@ -132,7 +129,8 @@ chunking:
 
 - ✅ Семантико-структурное чанкование (таблицы, заголовки)
 - ✅ Обработка числовых значений (валюты, проценты, курсы)
-- ✅ Гибридный ретрив (FAISS + BM25) с RRF fusion
+- ✅ FlashRAG BM25s ретривер + CrossEncoder реранкер
+- ✅ Батчевая обработка запросов (retrieval + rerank)
 - ✅ Cross-encoder реранкинг
 - ✅ Детальное логирование провалов для анализа
 - ✅ Полная воспроизводимость (конфиги, версии)

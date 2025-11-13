@@ -118,17 +118,54 @@ class Reranker:
         Returns:
             List of reranked candidates per query, or (results, scores_list) if return_scores
         """
-        results = []
-        scores_list = []
+        if not queries:
+            return ([], []) if return_scores else []
+        
+        pair_inputs: List[List[str]] = []
+        candidate_counts: List[int] = []
         
         for query, candidates in zip(queries, candidates_list):
+            count = 0
+            for candidate in candidates:
+                text = candidate.get("contents", candidate.get("text", ""))
+                if not text:
+                    text = str(candidate.get("chunk_id", ""))
+                pair_inputs.append([query, text])
+                count += 1
+            candidate_counts.append(count)
+        
+        if not pair_inputs:
+            empty_results = [[] for _ in queries]
+            return (empty_results, [[] for _ in queries]) if return_scores else empty_results
+        
+        scores: List[float] = []
+        for i in range(0, len(pair_inputs), self.batch_size):
+            batch_pairs = pair_inputs[i:i + self.batch_size]
+            batch_scores = self.model.predict(batch_pairs, show_progress_bar=False)
+            scores.extend(batch_scores.tolist())
+        
+        results: List[List[Dict]] = []
+        scores_list: List[List[float]] = []
+        score_idx = 0
+        
+        for candidates, count in zip(candidates_list, candidate_counts):
+            candidate_scores = scores[score_idx:score_idx + count]
+            score_idx += count
+            
+            scored_candidates = []
+            for candidate, score in zip(candidates, candidate_scores):
+                candidate_copy = dict(candidate)
+                candidate_copy["rerank_score"] = float(score)
+                if "score" not in candidate_copy:
+                    candidate_copy["score"] = float(score)
+                scored_candidates.append((candidate_copy, float(score)))
+            
+            scored_candidates.sort(key=lambda x: x[1], reverse=True)
+            top_candidates = [cand for cand, _ in scored_candidates[:top_k]]
+            results.append(top_candidates)
             if return_scores:
-                reranked, scores = self.rerank(query, candidates, top_k=top_k, return_scores=True)
-                results.append(reranked)
-                scores_list.append(scores)
-            else:
-                reranked = self.rerank(query, candidates, top_k=top_k, return_scores=False)
-                results.append(reranked)
+                top_scores = [score for _, score in scored_candidates[:top_k]]
+                scores_list.append(top_scores)
         
         if return_scores:
             return results, scores_list

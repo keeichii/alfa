@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 # add project root to path
@@ -54,7 +55,6 @@ def main():
     
     # get paths
     questions_path = config["data"]["raw_questions"]
-    faiss_dir = config["indexes"]["faiss_dir"]
     bm25_dir = config["indexes"]["bm25_dir"]
     submits_dir = config["outputs"]["submits_dir"]
     
@@ -63,36 +63,41 @@ def main():
     k_retrieve = retrieval_config["k_retrieve"]
     k_final = retrieval_config["k_final"]
     use_reranker = retrieval_config.get("use_reranker", True)
-    weight_dense = retrieval_config["hybrid_weight_dense"]
-    weight_bm25 = retrieval_config["hybrid_weight_bm25"]
     
-    embeddings_config = models_config["embeddings"]
     reranker_config = models_config["reranker"]
+    bm25_corpus_override = retrieval_config.get("bm25_corpus_path")
     
     # read questions
     logger.info(f"Reading questions from {questions_path}")
     questions = read_questions(questions_path)
     logger.info(f"Loaded {len(questions)} questions")
     
-    # find FAISS index file
-    faiss_path = Path(faiss_dir)
+    # initialize retriever
+    logger.info("Initializing hybrid retriever (FAISS + FlashRAG bm25s)...")
+    faiss_path = Path(config["indexes"]["faiss_dir"])
     faiss_index_files = list(faiss_path.glob("*.index"))
     if not faiss_index_files:
-        raise FileNotFoundError(f"No FAISS index found in {faiss_dir}")
+        raise FileNotFoundError(f"No FAISS index found in {faiss_path}")
     faiss_index_path = faiss_index_files[0]
     faiss_meta_path = faiss_path / "faiss_meta.json"
-    
-    # initialize retriever
-    logger.info("Initializing hybrid retriever...")
+    if not faiss_meta_path.exists():
+        faiss_meta_path = None
+
+    bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
+    embeddings_config = models_config["embeddings"]
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
-        faiss_meta_path=str(faiss_meta_path) if faiss_meta_path.exists() else None,
-        bm25_index_path=bm25_dir,
+        faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
+        bm25_index_dir=bm25_dir,
+        bm25_corpus_path=bm25_corpus_path,
         embedding_model_name=embeddings_config["model_name"],
-        weight_dense=weight_dense,
-        weight_bm25=weight_bm25,
         device=embeddings_config["device"],
-        normalize_embeddings=embeddings_config.get("normalize_embeddings", True)
+        normalize_embeddings=embeddings_config.get("normalize_embeddings", True),
+        query_batch_size=retrieval_config.get("batch_size", embeddings_config.get("batch_size", 32)),
+        weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
+        weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
+        fusion_method=retrieval_config.get("fusion_method", "weighted"),
+        enhance_numerics=retrieval_config.get("enhance_numerics", True),
     )
     
     # initialize reranker if enabled
@@ -105,34 +110,104 @@ def main():
             batch_size=reranker_config["batch_size"]
         )
     
-    # process questions with progress bar
-    logger.info("Processing questions...")
+    total_questions = len(questions)
+    logger.info(f"Processing {total_questions} questions...")
     results = {}
     
+    retrieval_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
+    
+    progress_bar = None
     try:
         from tqdm import tqdm
-        question_iter = tqdm(questions, desc="Processing questions")
+        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", mininterval=10.0)
     except ImportError:
-        question_iter = questions
         logger.warning("tqdm not available, progress bar disabled")
     
-    for q_id, query in question_iter:
-        # retrieve
-        candidates = retriever.retrieve(query, k=k_retrieve, return_scores=False)
+    start_time = time.time()
+    last_log_time = start_time
+    processed = 0
+    
+    for batch_start in range(0, total_questions, retrieval_batch_size):
+        batch = questions[batch_start:batch_start + retrieval_batch_size]
+        q_ids = [q for q, _ in batch]
+        query_texts = [query for _, query in batch]
         
-        # rerank if enabled
-        if reranker and candidates:
-            candidates = reranker.rerank(query, candidates, top_k=k_final, return_scores=False)
+        try:
+            batch_candidates = retriever.retrieve_batch(
+                query_texts,
+                k=k_retrieve,
+                return_scores=False,
+            )
+        except Exception as e:
+            logger.error(f"Batch retrieval failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
+            batch_candidates = [[] for _ in batch]
         
-        # extract web_ids (doc_ids) - ensure exactly 5
-        web_ids = [int(c["doc_id"]) for c in candidates[:k_final]]
+        if reranker:
+            rerank_inputs = [
+                [dict(candidate) for candidate in candidates[:k_rerank]]
+                for candidates in batch_candidates
+            ]
+            try:
+                reranked_batch = reranker.batch_rerank(
+                    query_texts,
+                    rerank_inputs,
+                    top_k=k_final,
+                    return_scores=False
+                )
+            except Exception as e:
+                logger.error(f"Batch reranking failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
+                reranked_batch = rerank_inputs
+        else:
+            reranked_batch = [candidates[:k_final] for candidates in batch_candidates]
         
-        # pad or truncate to exactly 5
-        while len(web_ids) < k_final:
-            web_ids.append(web_ids[-1] if web_ids else 1)  # repeat last or use default
-        web_ids = web_ids[:k_final]
+        for local_idx, (q_id, query_text) in enumerate(batch):
+            if batch_start == 0 and local_idx == 0:
+                logger.info(f"Starting processing: question {q_id} - '{query_text[:50]}...'")
+                sys.stdout.flush()
+            
+            candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
+            final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
+            if not final_candidates:
+                final_candidates = candidates[:k_final]
+            
+            web_ids = [int(c["doc_id"]) for c in final_candidates[:k_final]]
+            if len(web_ids) < k_final:
+                for candidate in candidates:
+                    doc_id = int(candidate["doc_id"])
+                    if doc_id not in web_ids:
+                        web_ids.append(doc_id)
+                    if len(web_ids) >= k_final:
+                        break
+            while len(web_ids) < k_final:
+                web_ids.append(web_ids[-1] if web_ids else 1)
+            web_ids = web_ids[:k_final]
+            results[q_id] = web_ids
+            
+            processed += 1
+            current_time = time.time()
+            if processed > 0 and (processed % 100 == 0 or (current_time - last_log_time) > 120):
+                elapsed = current_time - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = (total_questions - processed) / rate if rate > 0 else 0
+                logger.info(
+                    f"Progress: {processed}/{total_questions} ({processed*100/total_questions:.1f}%), "
+                    f"elapsed: {elapsed/60:.1f}min, ETA: {remaining/60:.1f}min"
+                )
+                sys.stdout.flush()
+                last_log_time = current_time
         
-        results[q_id] = web_ids
+        if progress_bar:
+            progress_bar.update(len(batch))
+    
+    if progress_bar:
+        progress_bar.close()
+    
+    elapsed_time = time.time() - start_time
+    logger.info(
+        f"✓ Processed {total_questions} questions in {elapsed_time/60:.1f} minutes "
+        f"({elapsed_time:.1f}s total, {elapsed_time/max(1, total_questions):.2f}s per question)"
+    )
     
     # generate submit.csv
     timestamp = get_timestamp()

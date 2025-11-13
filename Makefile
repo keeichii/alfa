@@ -7,7 +7,7 @@ help:
 	@echo "Available targets:"
 	@echo "  make build_corpus    - Build corpus.jsonl from websites CSV"
 	@echo "  make chunk_corpus    - Chunk corpus into smaller pieces"
-	@echo "  make build_index     - Build FAISS and BM25 indexes"
+	@echo "  make build_index     - Build BM25 index via FlashRAG"
 	@echo "  make eval            - Evaluate retrieval and generate metrics report"
 	@echo "  make submit          - Generate submit.csv for submission"
 	@echo "  make clean           - Clean processed data and indexes"

@@ -6,6 +6,7 @@ Usage:
     python scripts/eval.py --config configs/base.yaml
 """
 import argparse
+import copy
 import json
 import sys
 import time
@@ -56,7 +57,6 @@ def main():
     
     # get paths
     questions_path = config["data"]["raw_questions"]
-    faiss_dir = config["indexes"]["faiss_dir"]
     bm25_dir = config["indexes"]["bm25_dir"]
     reports_dir = config["outputs"]["reports_dir"]
     logs_dir = config["outputs"]["logs_dir"]
@@ -65,43 +65,44 @@ def main():
     retrieval_config = config["retrieval"]
     k_retrieve = retrieval_config["k_retrieve"]
     k_final = retrieval_config["k_final"]
+    k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
     use_reranker = retrieval_config.get("use_reranker", True)
-    weight_dense = retrieval_config["hybrid_weight_dense"]
-    weight_bm25 = retrieval_config["hybrid_weight_bm25"]
     
-    embeddings_config = models_config["embeddings"]
     reranker_config = models_config["reranker"]
+    bm25_corpus_override = retrieval_config.get("bm25_corpus_path")
     
     # read questions
     logger.info(f"Reading questions from {questions_path}")
     questions = read_questions(questions_path)
     logger.info(f"Loaded {len(questions)} questions")
     
-    # find FAISS index file
-    faiss_path = Path(faiss_dir)
+    # initialize retriever
+    logger.info("Initializing hybrid retriever (FAISS + FlashRAG bm25s)...")
+    # find FAISS index and optional meta
+    faiss_path = Path(config["indexes"]["faiss_dir"])
     faiss_index_files = list(faiss_path.glob("*.index"))
     if not faiss_index_files:
-        raise FileNotFoundError(f"No FAISS index found in {faiss_dir}")
+        raise FileNotFoundError(f"No FAISS index found in {faiss_path}")
     faiss_index_path = faiss_index_files[0]
     faiss_meta_path = faiss_path / "faiss_meta.json"
-    
     if not faiss_meta_path.exists():
-        logger.info(f"Using FAISS metadata from {faiss_meta_path}")
-    else:
-        logger.warning(f"FAISS metadata not found at {faiss_meta_path}, will try to infer from chunks")
         faiss_meta_path = None
-    
-    # initialize retriever
-    logger.info("Initializing hybrid retriever...")
+
+    bm25_corpus_path = bm25_corpus_override or str(Path(bm25_dir) / "chunks.jsonl")
+    embeddings_config = models_config["embeddings"]
     retriever = HybridRetriever(
         faiss_index_path=str(faiss_index_path),
         faiss_meta_path=str(faiss_meta_path) if faiss_meta_path else None,
-        bm25_index_path=bm25_dir,
+        bm25_index_dir=bm25_dir,
+        bm25_corpus_path=bm25_corpus_path,
         embedding_model_name=embeddings_config["model_name"],
-        weight_dense=weight_dense,
-        weight_bm25=weight_bm25,
         device=embeddings_config["device"],
-        normalize_embeddings=embeddings_config.get("normalize_embeddings", True)
+        normalize_embeddings=embeddings_config.get("normalize_embeddings", True),
+        query_batch_size=retrieval_config.get("batch_size", embeddings_config.get("batch_size", 32)),
+        weight_dense=retrieval_config.get("hybrid_weight_dense", 0.6),
+        weight_bm25=retrieval_config.get("hybrid_weight_bm25", 0.4),
+        fusion_method=retrieval_config.get("fusion_method", "weighted"),
+        enhance_numerics=retrieval_config.get("enhance_numerics", True),
     )
     
     # initialize reranker if enabled
@@ -123,80 +124,197 @@ def main():
     failure_logger = FailureLogger(evaluator.ground_truth)
     
     # process questions
-    logger.info("Processing questions...")
-    results = {}
+    total_questions = len(questions)
+    logger.info(f"Processing {total_questions} questions...")
+    sys.stdout.flush()
+    results: dict[int, list[int]] = {}
     candidate_logs = []
     
     start_time = time.time()
-    for q_id, query in questions:
-        # retrieve with fusion method from config
-        fusion_method = retrieval_config.get("fusion_method", "weighted")
-        candidates, scores = retriever.retrieve(
-            query, 
-            k=k_retrieve, 
-            return_scores=True,
-            fusion_method=fusion_method
-        )
+    last_log_time = start_time
+    processed = 0
+    first_question_logged = False
+    
+    retrieval_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    # progress bar configured not to interfere with logging
+    progress_bar = None
+    try:
+        from tqdm import tqdm
+        progress_bar = tqdm(total=total_questions, desc="Processing", unit="q", file=sys.stderr, mininterval=10.0)
+    except ImportError:
+        logger.warning("tqdm not available, progress bar disabled")
+    
+    logger.info("Starting question processing loop...")
+    sys.stdout.flush()
+    
+    for batch_start in range(0, total_questions, retrieval_batch_size):
+        batch = questions[batch_start:batch_start + retrieval_batch_size]
+        q_ids = [q for q, _ in batch]
+        query_texts = [query for _, query in batch]
         
-        # log candidates before reranking
-        log_entry_before = {
-            "q_id": q_id,
-            "query": query,
-            "stage": "before_rerank",
-            "candidates": [
-                {
-                    "chunk_id": c["chunk_id"],
-                    "doc_id": int(c["doc_id"]),
-                    "score": c["score"],
-                    "dense_score": c.get("dense_score", 0.0),
-                    "bm25_score": c.get("bm25_score", 0.0)
-                }
-                for c in candidates[:k_retrieve]
+        batch_candidates = [[] for _ in batch]
+        batch_scores = [{} for _ in batch]
+        
+        retrieve_start = time.time()
+        try:
+            batch_candidates, batch_scores = retriever.retrieve_batch(
+                query_texts,
+                k=k_retrieve,
+                return_scores=True,
+            )
+        except Exception as e:
+            logger.error(f"Batch retrieval failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
+            batch_candidates = [[] for _ in batch]
+            batch_scores = [{} for _ in batch]
+        batch_retrieve_time = time.time() - retrieve_start
+        avg_retrieve_time = batch_retrieve_time / max(1, len(batch))
+        
+        original_candidates = [copy.deepcopy(cands) for cands in batch_candidates]
+        
+        reranked_batch = [cands[:k_final] for cands in batch_candidates]
+        batch_rerank_time = 0.0
+        
+        if reranker:
+            rerank_inputs = [
+                [dict(candidate) for candidate in candidates[:k_rerank]]
+                for candidates in batch_candidates
             ]
-        }
-        candidate_logs.append(log_entry_before)
+            rerank_start = time.time()
+            try:
+                reranked_batch = reranker.batch_rerank(
+                    query_texts,
+                    rerank_inputs,
+                    top_k=k_final,
+                    return_scores=False
+                )
+            except Exception as e:
+                logger.error(f"Batch reranking failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
+                reranked_batch = rerank_inputs
+            batch_rerank_time = time.time() - rerank_start
+        avg_rerank_time = batch_rerank_time / max(1, len(batch))
         
-        # rerank if enabled
-        candidates_after_rerank = None
-        if reranker and candidates:
-            candidates_before_rerank_list = candidates.copy()
-            candidates = reranker.rerank(query, candidates, top_k=k_final, return_scores=False)
-            candidates_after_rerank = candidates
+        for local_idx, (q_id, query_text) in enumerate(batch):
+            global_idx = batch_start + local_idx
+            candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
+            scores = batch_scores[local_idx] if local_idx < len(batch_scores) else {}
+            candidates_before_rerank_list = original_candidates[local_idx] if local_idx < len(original_candidates) else []
+            reranked_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
             
-            # log candidates after reranking
-            log_entry_after = {
+            if not first_question_logged:
+                logger.info(f"✓ Starting processing: question {q_id} - '{query_text[:50]}...'")
+                sys.stdout.flush()
+                first_question_logged = True
+            elif global_idx % 100 == 0:
+                logger.info(f"✓ Processed {global_idx} questions so far...")
+                sys.stdout.flush()
+            
+            if global_idx < 5:
+                logger.info(f"  [Q{q_id}] Retrieval done in {avg_retrieve_time:.2f}s (batch avg)")
+                if reranker and reranked_candidates:
+                    logger.info(f"  [Q{q_id}] Reranking done in {avg_rerank_time:.2f}s (batch avg)")
+                sys.stdout.flush()
+            elif global_idx % 100 == 0:
+                logger.info(f"  [Q{q_id}] Retrieval batch avg {avg_retrieve_time:.2f}s")
+                if reranker and reranked_candidates:
+                    logger.info(f"  [Q{q_id}] Rerank batch avg {avg_rerank_time:.2f}s")
+                sys.stdout.flush()
+            
+            # log progress every 10 questions (first 50), then every 50, or every minute
+            processed += 1
+            current_time = time.time()
+            should_log = False
+            if processed == 1:
+                should_log = True
+            elif processed < 50 and processed % 10 == 0:
+                should_log = True
+            elif processed % 50 == 0:
+                should_log = True
+            elif (current_time - last_log_time) > 60:
+                should_log = True
+            
+            if should_log:
+                elapsed = current_time - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = (total_questions - processed) / rate if rate > 0 else 0
+                logger.info(
+                    f"Progress: {processed}/{total_questions} questions "
+                    f"({processed*100/total_questions:.1f}%), "
+                    f"elapsed: {elapsed/60:.1f}min, "
+                    f"rate: {rate:.2f} q/s, "
+                    f"ETA: {remaining/60:.1f}min"
+                )
+                sys.stdout.flush()
+                last_log_time = current_time
+            
+            # log candidates before reranking
+            log_entry_before = {
                 "q_id": q_id,
-                "query": query,
-                "stage": "after_rerank",
+                "query": query_text,
+                "stage": "before_rerank",
                 "candidates": [
                     {
                         "chunk_id": c["chunk_id"],
                         "doc_id": int(c["doc_id"]),
-                        "score": c.get("rerank_score", c.get("score", 0.0))
+                        "score": c["score"],
+                        "dense_score": c.get("dense_score", 0.0),
+                        "bm25_score": c.get("bm25_score", 0.0)
                     }
-                    for c in candidates[:k_final]
+                    for c in candidates[:k_retrieve]
                 ]
             }
-            candidate_logs.append(log_entry_after)
-        else:
-            candidates_before_rerank_list = candidates
+            candidate_logs.append(log_entry_before)
+            
+            candidates_after_rerank = reranked_candidates if reranker else None
+            
+            if reranker and reranked_candidates:
+                log_entry_after = {
+                    "q_id": q_id,
+                    "query": query_text,
+                    "stage": "after_rerank",
+                    "candidates": [
+                        {
+                            "chunk_id": c["chunk_id"],
+                            "doc_id": int(c["doc_id"]),
+                            "score": c.get("rerank_score", c.get("score", 0.0))
+                        }
+                        for c in reranked_candidates[:k_final]
+                    ]
+                }
+                candidate_logs.append(log_entry_after)
+            
+            # extract web_ids (doc_ids)
+            final_candidates = reranked_candidates if reranker else candidates[:k_final]
+            web_ids = [int(c["doc_id"]) for c in final_candidates[:k_final]]
+            if len(web_ids) < k_final and candidates:
+                # pad with available candidates
+                additional = [int(c["doc_id"]) for c in candidates[k_final:]]
+                web_ids.extend(additional[: k_final - len(web_ids)])
+            while len(web_ids) < k_final:
+                web_ids.append(web_ids[-1] if web_ids else 1)
+            web_ids = web_ids[:k_final]
+            results[q_id] = web_ids
+            
+            failure_logger.log_retrieval_failure(
+                q_id=q_id,
+                query=query_text,
+                retrieved_web_ids=web_ids,
+                candidates_before_rerank=candidates_before_rerank_list,
+                candidates_after_rerank=candidates_after_rerank,
+                k=k_final
+            )
         
-        # extract web_ids (doc_ids)
-        web_ids = [int(c["doc_id"]) for c in candidates[:k_final]]
-        results[q_id] = web_ids
-        
-        # log failures
-        failure_logger.log_retrieval_failure(
-            q_id=q_id,
-            query=query,
-            retrieved_web_ids=web_ids,
-            candidates_before_rerank=candidates_before_rerank_list,
-            candidates_after_rerank=candidates_after_rerank,
-            k=k_final
-        )
+        if progress_bar:
+            progress_bar.update(len(batch))
+    
+    if progress_bar:
+        progress_bar.close()
     
     elapsed_time = time.time() - start_time
-    logger.info(f"Processed {len(questions)} questions in {elapsed_time:.2f} seconds")
+    avg_time_per_question = elapsed_time / len(questions) if questions else 0
+    logger.info(
+        f"✓ Processed {len(questions)} questions in {elapsed_time/60:.1f} minutes "
+        f"({elapsed_time:.1f}s total, {avg_time_per_question:.2f}s per question)"
+    )
     
     # evaluate if ground truth available
     metrics = {}
@@ -219,11 +337,12 @@ def main():
         "timestamp": timestamp,
         "config": {
             "k_retrieve": k_retrieve,
+            "k_rerank": k_rerank,
             "k_final": k_final,
             "use_reranker": use_reranker,
-            "hybrid_weight_dense": weight_dense,
-            "hybrid_weight_bm25": weight_bm25,
-            "embedding_model": embeddings_config["model_name"],
+            "bm25_backend": models_config["bm25"]["backend"],
+            "retrieval_batch_size": retrieval_batch_size,
+            "enhance_numerics": retrieval_config.get("enhance_numerics", True),
             "reranker_model": reranker_config["model_name"] if use_reranker else None
         },
         "metrics": metrics,

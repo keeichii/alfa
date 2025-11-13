@@ -16,13 +16,15 @@ outputs:
   logs_dir: outputs/logs
 
 retrieval:
-  k_retrieve: 50  # retrieve top-k candidates before reranking
+  k_retrieve: 30  # retrieve top-k candidates before reranking
+  k_rerank: 20  # number of candidates passed to the reranker
   k_final: 5  # final top-k for submission
   hybrid_weight_dense: 0.6  # weight for dense vector similarity
   hybrid_weight_bm25: 0.4  # weight for BM25 score
-  use_reranker: true  # enable/disable reranking
   fusion_method: "weighted"  # "weighted" or "rrf" (Reciprocal Rank Fusion)
+  use_reranker: true  # enable/disable reranking
   enhance_numerics: true  # enhance queries for numeric value matching
+  batch_size: 32  # number of questions processed per retrieval batch
 
 chunking:
   size_tokens: 600

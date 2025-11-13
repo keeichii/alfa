@@ -37,8 +37,11 @@ outputs/submits/*
 outputs/reports/*
 outputs/logs/*
 
-# FlashRAG (external library, should be installed separately)
-FlashRAG/
+# FlashRAG vendor dir is kept in repo but ignore its build artifacts
+FlashRAG/**/__pycache__/
+FlashRAG/**/.ipynb_checkpoints
+FlashRAG/**/dist/
+FlashRAG/**/build/
 
 # Temporary files
 *.tmp

@@ -9,9 +9,15 @@ from typing import Any, Dict, List, Optional
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True  # force reconfiguration
 )
 logger = logging.getLogger(__name__)
+
+# ensure immediate flushing
+for handler in logger.handlers:
+    handler.flush()
+sys.stdout.flush()
 
 
 def load_jsonl(file_path: str) -> List[Dict[str, Any]]:
