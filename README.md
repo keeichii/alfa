@@ -45,6 +45,10 @@ alfa/
 # 1. Установка Python пакетов
 # 1. Установка Python пакетов (faiss-cpu по умолчанию)
 pip install -r requirements.txt
+pip install pyyaml
+pip install chonkie
+pip install datasets
+pip install langid
 
 # 1a. Для GPU: установите faiss-gpu и torch с поддержкой CUDA
 pip install faiss-gpu torch --extra-index-url https://download.pytorch.org/whl/cu121

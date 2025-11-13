@@ -603,14 +603,38 @@ class Index_Builder:
         faiss_index = faiss.index_factory(dim, faiss_type, faiss.METRIC_INNER_PRODUCT)
 
         if self.faiss_gpu:
-            co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
-            co.shard = True
-            faiss_index = faiss.index_cpu_to_all_gpus(faiss_index, co)
-            if not faiss_index.is_trained:
-                faiss_index.train(all_embeddings)
-            faiss_index.add(all_embeddings)
-            faiss_index = faiss.index_gpu_to_cpu(faiss_index)
+            if torch is None or not torch.cuda.is_available():
+                raise RuntimeError("FAISS GPU build requested but CUDA is not available.")
+
+            gpu_count = torch.cuda.device_count()
+            gpu_id = torch.cuda.current_device()
+            gpu_resources = faiss.StandardGpuResources()
+
+            try:
+                if gpu_count > 1 and hasattr(faiss, "GpuMultipleClonerOptions"):
+                    multi_co = faiss.GpuMultipleClonerOptions()
+                    multi_co.useFloat16 = True
+                    multi_co.shard = True
+                    faiss_index_gpu = faiss.index_cpu_to_all_gpus(faiss_index, multi_co)
+                else:
+                    if not hasattr(faiss, "GpuClonerOptions") or not hasattr(faiss, "index_cpu_to_gpu"):
+                        raise AttributeError("GPU cloning APIs are missing in the installed faiss package.")
+                    single_co = faiss.GpuClonerOptions()
+                    single_co.useFloat16 = True
+                    faiss_index_gpu = faiss.index_cpu_to_gpu(gpu_resources, int(gpu_id), faiss_index, single_co)
+
+                if not faiss_index_gpu.is_trained:
+                    faiss_index_gpu.train(all_embeddings)
+                faiss_index_gpu.add(all_embeddings)
+                faiss_index = faiss.index_gpu_to_cpu(faiss_index_gpu)
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "Installed faiss-gpu build lacks required GPU cloning APIs. "
+                    "Install a compatible faiss-gpu (e.g. via conda: `conda install -c pytorch faiss-gpu=1.7.4 cudatoolkit=11.8`)."
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(f"Failed to build FAISS index on GPU: {exc}") from exc
+
         else:
             if not faiss_index.is_trained:
                 faiss_index.train(all_embeddings)
