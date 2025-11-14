@@ -6,7 +6,7 @@ embeddings:
   # - "intfloat/multilingual-e5-base" (faster, less accurate)
   # - "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
   device: "auto"          # must resolve to CUDA; raises if kernels absent
-  batch_size: 64          # reduced batch size for large model (was 128 for base)
+  batch_size: 48          # reduced batch size for large model to fit 8GB GPUs
   normalize_embeddings: true
   use_fp16: true          # enable half precision on GPU
 

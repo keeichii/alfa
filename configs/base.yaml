@@ -28,9 +28,12 @@ retrieval:
   min_score_threshold: 0.0  # minimum score threshold before reranking (0.0 = no filtering)
   filter_by_document_type: false  # filter candidates by document type (has_table, etc.)
   prefer_table_chunks: false  # prefer chunks with tables for numeric queries
-  batch_size: 32  # number of questions processed per retrieval batch (reduced for stability)
-  reranker_batch_size: 64  # batch size for reranker (increased for GPU efficiency)
-  num_workers: 4  # number of parallel threads for batch processing
+  batch_size: 48  # base batch size for retrieval optimizer
+  min_retrieval_batch_size: 16  # hard floor for batch optimizer (prevents huge batches on small GPUs)
+  max_retrieval_batch_size: 96  # cap to avoid VRAM spikes (GTX 1070 safe)
+  reranker_batch_size: 24  # batch size for reranker (smaller to avoid OOM on 8GB GPUs)
+  reranker_oom_retries: 2  # automatic retries with smaller batches on CUDA OOM
+  num_workers: 1  # multithreading disabled when FAISS GPU is enabled (prevents StackDeviceMemory asserts)
   prefetch_batches: 2  # number of batches to prefetch ahead
 
 chunking:

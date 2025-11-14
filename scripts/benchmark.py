@@ -7,8 +7,14 @@ Usage:
 """
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -16,6 +22,7 @@ sys.path.insert(0, str(project_root / "FlashRAG"))
 
 import yaml
 import csv
+from src.batch_processor import optimize_batch_size
 from src.retriever import HybridRetriever
 from src.reranker import Reranker
 from src.reranker_ensemble import RerankerEnsemble
@@ -26,6 +33,11 @@ def load_config(config_path: str) -> dict:
     """Load YAML configuration file."""
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "cublas_status_alloc_failed" in message
 
 
 def main():
@@ -109,6 +121,8 @@ def main():
     
     # initialize reranker
     reranker = None
+    reranker_lock = threading.Lock()
+    reranker_oom_retries = max(0, int(retrieval_config.get("reranker_oom_retries", 1)))
     if use_reranker:
         logger.info("Initializing reranker...")
         reranker_device = resolve_device(reranker_config.get("device", "auto"))
@@ -120,7 +134,21 @@ def main():
             use_fp16=reranker_config.get("use_fp16", False),
         )
     
-    retrieval_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    base_batch_size = max(1, retrieval_config.get("batch_size", 32))
+    min_retrieval_batch = max(
+        1,
+        retrieval_config.get("min_retrieval_batch_size", min(16, base_batch_size)),
+    )
+    max_retrieval_batch = max(
+        min_retrieval_batch,
+        retrieval_config.get("max_retrieval_batch_size", base_batch_size),
+    )
+    retrieval_batch_size = optimize_batch_size(
+        base_batch_size,
+        len(questions),
+        min_batch=min_retrieval_batch,
+        max_batch=max_retrieval_batch,
+    )
     k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
     
     # benchmark retrieval only
@@ -153,12 +181,32 @@ def main():
                 [dict(candidate) for candidate in candidates[:k_rerank]]
                 for candidates in batch_candidates
             ]
-            reranker.batch_rerank(
-                batch_queries,
-                rerank_inputs,
-                top_k=k_final,
-                return_scores=False
-            )
+            attempts = 0
+            while True:
+                try:
+                    with reranker_lock:
+                        reranker.batch_rerank(
+                            batch_queries,
+                            rerank_inputs,
+                            top_k=k_final,
+                            return_scores=False,
+                        )
+                    break
+                except RuntimeError as exc:
+                    if _is_cuda_oom(exc) and attempts < reranker_oom_retries:
+                        attempts += 1
+                        logger.warning(
+                            "Benchmark reranker OOM (attempt %s/%s). Retrying with smaller batch size...",
+                            attempts,
+                            reranker_oom_retries,
+                        )
+                        if torch and torch.cuda.is_available():  # type: ignore[attr-defined]
+                            torch.cuda.empty_cache()
+                        shrunk = getattr(reranker, "shrink_batch_size", lambda **_: False)()
+                        if shrunk:
+                            continue
+                    logger.error("Benchmark reranker failed: %s", exc)
+                    break
         full_time = time.time() - start
         full_per_q = full_time / len(questions) if questions else 0.0
         rerank_per_q = max(0.0, full_per_q - retrieval_per_q)

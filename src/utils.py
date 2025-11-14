@@ -1,10 +1,14 @@
 """Utility functions for the RAG pipeline."""
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Mitigate CUDA memory fragmentation on smaller GPUs (see PyTorch docs)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 try:
     import torch  # type: ignore

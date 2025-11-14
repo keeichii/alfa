@@ -60,6 +60,7 @@ class RerankerEnsemble:
         self.weights = weights
         self.second_pass = second_pass
         self.second_pass_topk = second_pass_topk
+        self.batch_size = max(1, batch_size)
         
         logger.info(f"Initializing ensemble reranker with {len(model_names)} models")
         logger.info(f"Models: {model_names}")
@@ -72,7 +73,7 @@ class RerankerEnsemble:
             reranker = Reranker(
                 model_name=model_name,
                 device=device,
-                batch_size=batch_size,
+                batch_size=self.batch_size,
                 max_length=max_length,
                 use_fp16=use_fp16,
             )
@@ -97,6 +98,22 @@ class RerankerEnsemble:
         if return_scores:
             return (results[0], scores[0])
         return results[0]
+
+    def shrink_batch_size(self, factor: float = 0.5, min_batch: int = 4) -> bool:
+        """
+        Reduce batch size across ensemble rerankers (used when CUDA OOM occurs).
+        """
+        changed = False
+        for reranker in self.rerankers:
+            changed = reranker.shrink_batch_size(factor=factor, min_batch=min_batch) or changed
+        if changed:
+            self.batch_size = min(r.batch_size for r in self.rerankers)
+            logger.warning(
+                "Ensemble reranker batch size reduced to %s (factor=%s)",
+                self.batch_size,
+                factor,
+            )
+        return changed
 
     def batch_rerank(
         self,

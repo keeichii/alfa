@@ -9,10 +9,16 @@ import argparse
 import csv
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 # add project root to path
 project_root = Path(__file__).parent.parent
@@ -75,6 +81,11 @@ def read_questions(csv_path: str) -> list[tuple[int, str]]:
             if q_id and query:
                 questions.append((q_id, query))
     return questions
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "cublas_status_alloc_failed" in message
 
 
 def main():
@@ -149,8 +160,22 @@ def main():
         faiss_use_fp16=faiss_config.get("use_float16", False),
     )
     
+    # Get num_workers BEFORE checking faiss_gpu_active
+    num_workers = max(1, retrieval_config.get("num_workers", 4))
+    
+    faiss_gpu_active = getattr(retriever, "faiss_use_gpu", False)
+
+    if faiss_gpu_active and num_workers > 1:
+        logger.warning(
+            "FAISS GPU search does not support concurrent threads on this GPU. "
+            "Forcing num_workers=1 to avoid StackDeviceMemory errors."
+        )
+        num_workers = 1
+
     # initialize reranker if enabled (single or ensemble)
     reranker = None
+    reranker_lock = threading.Lock()
+    reranker_oom_retries = max(0, int(retrieval_config.get("reranker_oom_retries", 1)))
     if use_reranker:
         reranker_device = resolve_device(reranker_config.get("device", "auto"))
         ensemble_config = models_config.get("reranker_ensemble", {})
@@ -182,11 +207,29 @@ def main():
     results = {}
     
     base_batch_size = max(1, retrieval_config.get("batch_size", 64))
-    num_workers = max(1, retrieval_config.get("num_workers", 4))
     k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
-    
-    retrieval_batch_size = optimize_batch_size(base_batch_size, total_questions)
-    logger.info(f"Optimized batch size: {retrieval_batch_size}, workers: {num_workers}")
+
+    min_retrieval_batch = max(
+        1,
+        retrieval_config.get("min_retrieval_batch_size", min(16, base_batch_size)),
+    )
+    max_retrieval_batch = max(
+        min_retrieval_batch,
+        retrieval_config.get("max_retrieval_batch_size", base_batch_size),
+    )
+    retrieval_batch_size = optimize_batch_size(
+        base_batch_size,
+        total_questions,
+        min_batch=min_retrieval_batch,
+        max_batch=max_retrieval_batch,
+    )
+    logger.info(
+        "Optimized batch size: %s (min=%s, max=%s), workers: %s",
+        retrieval_batch_size,
+        min_retrieval_batch,
+        max_retrieval_batch,
+        num_workers,
+    )
     
     progress_bar = None
     try:
@@ -221,16 +264,42 @@ def main():
                 [dict(candidate) for candidate in candidates[:k_rerank]]
                 for candidates in batch_candidates
             ]
-            try:
-                reranked_batch = reranker.batch_rerank(
-                    query_texts,
-                    rerank_inputs,
-                    top_k=k_final,
-                    return_scores=False
-                )
-            except Exception as e:
-                logger.error(f"Batch reranking failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
-                reranked_batch = rerank_inputs
+
+            def _run_reranker_with_retry() -> List[List[Dict]]:
+                attempts = 0
+                while True:
+                    try:
+                        with reranker_lock:
+                            return reranker.batch_rerank(
+                                query_texts,
+                                rerank_inputs,
+                                top_k=k_final,
+                                return_scores=False,
+                            )
+                    except RuntimeError as exc:
+                        if _is_cuda_oom(exc) and attempts < reranker_oom_retries:
+                            attempts += 1
+                            logger.warning(
+                                "Reranker OOM for questions %s-%s (attempt %s/%s). Retrying with smaller batch size...",
+                                q_ids[0] if q_ids else "N/A",
+                                q_ids[-1] if q_ids else "N/A",
+                                attempts,
+                                reranker_oom_retries,
+                            )
+                            if torch and torch.cuda.is_available():  # type: ignore[attr-defined]
+                                torch.cuda.empty_cache()
+                            shrunk = getattr(reranker, "shrink_batch_size", lambda **_: False)()
+                            if shrunk:
+                                continue
+                        logger.error(
+                            "Batch reranking failed for questions %s-%s: %s",
+                            q_ids[0] if q_ids else "N/A",
+                            q_ids[-1] if q_ids else "N/A",
+                            exc,
+                        )
+                        return rerank_inputs
+
+            reranked_batch = _run_reranker_with_retry()
         else:
             reranked_batch = [candidates[:k_final] for candidates in batch_candidates]
         

@@ -32,6 +32,7 @@ class Reranker:
         self.batch_size = max(1, int(batch_size))
         self.max_length = max(1, int(max_length))
         self.default_topk = 5
+        self._min_batch_size = 4
 
         config = {
             "rerank_model_name": model_name,
@@ -45,6 +46,37 @@ class Reranker:
 
         logger.info("Loading FlashRAG CrossReranker: %s", model_name)
         self._reranker = CrossReranker(config)
+
+    # ------------------------------------------------------------------ #
+    # Dynamic batch-size controls
+    # ------------------------------------------------------------------ #
+
+    def shrink_batch_size(self, factor: float = 0.5, min_batch: int | None = None) -> bool:
+        """
+        Reduce reranker batch size to mitigate CUDA OOM.
+
+        Args:
+            factor: Multiplicative factor to apply (default=0.5).
+            min_batch: Optional explicit floor (defaults to internal minimum).
+
+        Returns:
+            True if batch size was reduced, False otherwise.
+        """
+        min_allowed = max(self._min_batch_size, 1 if min_batch is None else int(min_batch))
+        target = max(min_allowed, int(self.batch_size * factor))
+        if target >= self.batch_size:
+            target = max(min_allowed, self.batch_size - 1)
+        if target < min_allowed:
+            target = min_allowed
+        if target < self.batch_size:
+            logger.warning(
+                "Reducing reranker batch size from %s to %s to avoid CUDA OOM",
+                self.batch_size,
+                target,
+            )
+            self.batch_size = target
+            return True
+        return False
 
     def rerank(
         self,
