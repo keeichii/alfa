@@ -95,6 +95,8 @@ class HybridRetriever:
 
         router_config = self._build_router_config()
         self.router = MultiRetrieverRouter(router_config)
+        # Set RRF k parameter for the router
+        self.router.rrf_k = self.rrf_k
         self._retriever_map = {getattr(r, "source_name", r.retrieval_method): r for r in self.router.retriever_list}
         logger.info(
             "Hybrid retriever initialised via FlashRAG: dense=%s, bm25=%s, fusion=%s",
@@ -154,7 +156,8 @@ class HybridRetriever:
             
             for doc_idx, doc in enumerate(docs[:topk]):
                 fallback_score = raw_scores[doc_idx] if doc_idx < len(raw_scores) else None
-                candidate = self._to_candidate(doc, fallback_score)
+                # Use original query (before normalization) for title/text scoring
+                candidate = self._to_candidate(doc, fallback_score, query=original_query)
                 
                 # Filter by minimum score threshold if enabled
                 if self.min_score_threshold > 0.0 and candidate["score"] < self.min_score_threshold:
@@ -341,13 +344,36 @@ class HybridRetriever:
         if not isinstance(source_scores, dict):
             source_scores = {}
 
+        # Get source scores - prefer from document fields, then from source_scores dict
         dense_score = float(doc.get("dense_score", source_scores.get("dense", 0.0)))
         bm25_score = float(doc.get("bm25_score", source_scores.get("bm25", 0.0)))
-        score = doc.get("score")
-        if score is None:
+        
+        # For display/logging: prioritize original source scores over RRF score
+        # RRF scores look like 1/(k+rank) and are typically 0.01-0.02 range
+        # Real BM25/dense scores are usually different (can be larger or have different distribution)
+        rrf_score = doc.get("rrf_score") or doc.get("score")
+        
+        # CRITICAL: If we have real source scores, use them for display
+        # RRF scores are rank-based and don't reflect actual relevance
+        if dense_score > 0 or bm25_score > 0:
+            # We have real source scores - use max of them for primary display
+            score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else None
+        elif rrf_score is not None:
+            # No source scores available, use RRF score
+            rrf_score = float(rrf_score)
+            # Check if RRF score looks like rank-based (very small, around 0.01-0.02)
+            if rrf_score < 0.1:
+                # This is likely RRF score, but we have no source scores, so use it
+                score = rrf_score
+            else:
+                # Might be a real score, use it
+                score = rrf_score
+        else:
+            # No scores available, use fallback
             score = fallback_score
+        
         if score is None:
-            score = max(dense_score, bm25_score)
+            score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else (fallback_score or 0.0)
         score = float(score or 0.0)
 
         candidate = {
@@ -356,6 +382,8 @@ class HybridRetriever:
             "score": score,
             "dense_score": dense_score,
             "bm25_score": bm25_score,
+            "title_score": title_score,
+            "text_score": text_score,
             "contents": doc.get("contents") or doc.get("text") or "",
             "source_scores": {key: float(value) for key, value in source_scores.items()},
             "sources": doc.get("sources", []),

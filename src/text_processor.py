@@ -271,6 +271,13 @@ def validate_document(title: str, text: str, strict: bool = False) -> tuple:
     if not title and not text:
         return False, "Both title and text are empty"
     
+    # IMPORTANT: If title is not empty, keep the document even if text is empty
+    # Title is more important than content for banking domain
+    title_stripped = title.strip() if title else ""
+    if title_stripped and not text:
+        # Title exists but text is empty - keep it
+        return True, None
+    
     text_stripped = text.strip() if text else ""
     text_len = len(text_stripped)
     
@@ -288,6 +295,9 @@ def validate_document(title: str, text: str, strict: bool = False) -> tuple:
         has_keywords = any(keyword in text_lower for keyword in banking_keywords)
         if has_keywords and not strict:
             return True, None  # Keep short but meaningful banking docs
+        # If title exists, keep document even with short text
+        if title_stripped:
+            return True, None  # Title is present, keep document
         return False, f"Text too short: {text_len} characters"
     
     # For very short texts (10-50 chars), be more lenient if they have keywords

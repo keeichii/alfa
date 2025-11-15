@@ -20,6 +20,10 @@ try:
 except Exception:  # pragma: no cover - torch is required in runtime env
     torch = None  # type: ignore
 
+# Increase CSV field size limit to handle large text fields
+import csv
+csv.field_size_limit(min(2**31 - 1, 10 * 1024 * 1024))
+
 # add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))

@@ -13,6 +13,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Increase CSV field size limit to handle large text fields
+# Default is 131072 (128KB), increase to 10MB
+csv.field_size_limit(min(2**31 - 1, 10 * 1024 * 1024))
+
 # add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))

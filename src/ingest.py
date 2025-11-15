@@ -79,12 +79,14 @@ def read_websites_csv(
                         })
                     continue
                 
-                # clean and normalize text
-                title = extract_and_clean_title(raw_title, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
-                text = extract_and_clean_text(raw_text, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
+                # IMPORTANT: Process tables BEFORE normalization
+                # Normalization removes table markers (|), so we need to process tables first
+                from src.table_processor import extract_table_structure
+                text, has_table = extract_table_structure(raw_text)
                 
-                # process tables to preserve structure
-                text, has_table = extract_table_structure(text)
+                # clean and normalize text (AFTER table processing)
+                title = extract_and_clean_title(raw_title, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
+                text = extract_and_clean_text(text, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
                 
                 # validate document quality (soft mode by default)
                 if validate:
@@ -126,7 +128,16 @@ def read_websites_csv(
                     continue
                 
                 # combine for compatibility (FlashRAG format)
-                contents = (title + "\n" + text).strip() if title else text
+                # Standard format: "title\ntext" - title and text separated by newline
+                # Title and text will be scored separately in retriever with title having higher weight
+                if title:
+                    if text:
+                        contents = f"{title}\n{text}".strip()
+                    else:
+                        # If no text, just use title (already validated that title exists)
+                        contents = title
+                else:
+                    contents = text
                 
                 corpus.append({
                     "id": web_id,

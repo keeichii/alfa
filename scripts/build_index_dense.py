@@ -56,11 +56,32 @@ def main():
     use_fp16 = embeddings_config.get("use_fp16", False) and embedding_device.startswith("cuda")
     faiss_gpu_enabled = faiss_config.get("use_gpu", False) and embedding_device.startswith("cuda")
     
+    # Normalize faiss_type: convert shorthand "IVFFlat" to proper format "IVF{nlist},Flat"
+    faiss_type = faiss_config.get("index_type", "Flat")
+    original_faiss_type = faiss_type
+    if faiss_type == "IVFFlat":
+        # Convert shorthand to proper format
+        nlist = faiss_config.get("nlist", 256)
+        faiss_type = f"IVF{nlist},Flat"
+        print(f"  Note: Converted 'IVFFlat' shorthand to '{faiss_type}'")
+    elif faiss_type.startswith("IVF") and "," not in faiss_type:
+        # Handle case where user wrote "IVF256" without ",Flat"
+        nlist = faiss_config.get("nlist", 256)
+        if faiss_type.startswith("IVF"):
+            # Extract nlist from string if present, otherwise use config
+            try:
+                nlist_from_str = int(faiss_type.replace("IVF", ""))
+                nlist = nlist_from_str
+            except ValueError:
+                pass
+        faiss_type = f"IVF{nlist},Flat"
+        print(f"  Note: Converted '{original_faiss_type}' to '{faiss_type}'")
+    
     print(f"Building FAISS index...")
     print(f"  Corpus: {corpus_path}")
     print(f"  Model: {model_path}")
     print(f"  Save dir: {save_dir}")
-    print(f"  FAISS type: {faiss_config['index_type']}")
+    print(f"  FAISS type: {faiss_type}")
     
     # Determine pooling method before building index (to save in metadata)
     # This matches the auto-detection logic in Index_Builder
@@ -111,7 +132,7 @@ def main():
         use_fp16=use_fp16,
         pooling_method=pooling_method,  # use detected pooling method
         instruction=instruction,  # auto-detect for E5/BGE
-        faiss_type=faiss_config["index_type"],
+        faiss_type=faiss_type,  # use normalized faiss_type
         faiss_gpu=faiss_gpu_enabled,
         use_sentence_transformer=True,  # use sentence-transformers for easier setup
         bm25_backend="bm25s"
@@ -141,7 +162,7 @@ def main():
         "doc_ids": doc_ids,
         "num_chunks": len(chunk_ids),
         "model_name": model_path,
-        "faiss_type": faiss_config["index_type"],
+        "faiss_type": faiss_type,  # save normalized faiss_type
         "pooling_method": pooling_method,  # Save for consistency with retrieval
         "max_length": 512,  # Document max length used during indexing
         "instruction": instruction  # Save instruction (None = auto-detect)

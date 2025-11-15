@@ -28,9 +28,33 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
     """
     Extract and normalize table structure, converting to readable text format.
     
+    IMPORTANT: This function is called AFTER normalize_for_retrieval, which may
+    remove table markers (|). So we need to handle cases where tables are
+    already partially processed.
+    
     Returns:
         (normalized_text, is_table) - normalized text with preserved structure
     """
+    if not text or not text.strip():
+        return text, False
+    
+    # Check if text contains table markers BEFORE normalization
+    # But since this is called after normalization, we need to detect tables
+    # by other means (multiple columns, aligned data, etc.)
+    
+    # If text is very short after normalization, it might be a table that was
+    # over-normalized. In this case, preserve the original structure.
+    if len(text.strip()) < 50:
+        # Check if it looks like table data (numbers, short words, separators)
+        # If so, don't process further - return as is
+        lines = text.split('\n')
+        if len(lines) >= 2:
+            # Check if lines have similar structure (potential table)
+            line_lengths = [len(line.strip()) for line in lines if line.strip()]
+            if line_lengths and max(line_lengths) - min(line_lengths) < 20:
+                # Similar line lengths - might be table, preserve as is
+                return text, False
+    
     if not detect_table(text):
         return text, False
     
@@ -38,13 +62,20 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
     normalized_lines = []
     is_table = False
     table_rows = []
+    has_regular_text = False
     
     for line in lines:
         line = line.strip()
         if not line:
             # If we were collecting a table, flush it
             if table_rows:
-                normalized_lines.extend(_format_table_as_text(table_rows))
+                formatted = _format_table_as_text(table_rows)
+                if formatted:  # Only add if formatting succeeded
+                    normalized_lines.extend(formatted)
+                else:
+                    # Formatting failed, preserve original table rows as text
+                    for row in table_rows:
+                        normalized_lines.append(' '.join(row))
                 table_rows = []
             normalized_lines.append("")
             continue
@@ -63,9 +94,16 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
             else:
                 # Not a table row, flush and add as regular text
                 if table_rows:
-                    normalized_lines.extend(_format_table_as_text(table_rows))
+                    formatted = _format_table_as_text(table_rows)
+                    if formatted:
+                        normalized_lines.extend(formatted)
+                    else:
+                        # Formatting failed, preserve original
+                        for row in table_rows:
+                            normalized_lines.append(' '.join(row))
                     table_rows = []
                 normalized_lines.append(line)
+                has_regular_text = True
         # Tab-separated or space-aligned
         elif '\t' in line or re.search(r'  +', line):
             is_table = True
@@ -79,21 +117,48 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
             else:
                 # Not a table row, flush and add as regular text
                 if table_rows:
-                    normalized_lines.extend(_format_table_as_text(table_rows))
+                    formatted = _format_table_as_text(table_rows)
+                    if formatted:
+                        normalized_lines.extend(formatted)
+                    else:
+                        # Formatting failed, preserve original
+                        for row in table_rows:
+                            normalized_lines.append(' '.join(row))
                     table_rows = []
                 normalized_lines.append(re.sub(r'[\t ]+', ' ', line).strip())
+                has_regular_text = True
         else:
             # Regular text line - flush table if collecting
             if table_rows:
-                normalized_lines.extend(_format_table_as_text(table_rows))
+                formatted = _format_table_as_text(table_rows)
+                if formatted:
+                    normalized_lines.extend(formatted)
+                else:
+                    # Formatting failed, preserve original
+                    for row in table_rows:
+                        normalized_lines.append(' '.join(row))
                 table_rows = []
             normalized_lines.append(line)
+            has_regular_text = True
     
     # Flush any remaining table
     if table_rows:
-        normalized_lines.extend(_format_table_as_text(table_rows))
+        formatted = _format_table_as_text(table_rows)
+        if formatted:
+            normalized_lines.extend(formatted)
+        else:
+            # Formatting failed, preserve original
+            for row in table_rows:
+                normalized_lines.append(' '.join(row))
     
     normalized_text = '\n'.join(normalized_lines)
+    
+    # CRITICAL: If normalized text is empty or too short, return original text
+    # This prevents losing content when table processing fails
+    if not normalized_text.strip() or len(normalized_text.strip()) < len(text.strip()) * 0.1:
+        # Table processing removed too much content, return original
+        return text, False
+    
     return normalized_text, is_table
 
 

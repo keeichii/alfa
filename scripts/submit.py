@@ -20,6 +20,9 @@ try:
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
+# Increase CSV field size limit to handle large text fields
+csv.field_size_limit(min(2**31 - 1, 10 * 1024 * 1024))
+
 # add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -30,8 +33,60 @@ from src.batch_processor import BatchProcessor, optimize_batch_size
 from src.retriever import HybridRetriever
 from src.reranker import Reranker
 from src.reranker_ensemble import RerankerEnsemble
-from src.utils import logger, get_timestamp, resolve_device
+from src.utils import logger, get_timestamp, resolve_device, load_jsonl
 from src.query_validator import validate_and_clean_questions
+
+# Cache for fallback web_ids (popular documents from corpus)
+_fallback_web_ids_cache = None
+
+def _get_fallback_web_ids(count: int, exclude: set) -> List[int]:
+    """Get fallback web_ids from corpus (most common documents)."""
+    global _fallback_web_ids_cache
+    
+    if _fallback_web_ids_cache is None:
+        # Load corpus and count document frequencies
+        from collections import Counter
+        from pathlib import Path
+        
+        # Get project_root from the module's parent directory
+        project_root = Path(__file__).parent.parent
+        corpus_path = project_root / "data" / "processed" / "corpus.jsonl"
+        
+        if corpus_path.exists():
+            doc_ids = []
+            for doc in load_jsonl(str(corpus_path)):
+                doc_id = doc.get("id", "")
+                if doc_id:
+                    try:
+                        doc_ids.append(int(doc_id))
+                    except (ValueError, TypeError):
+                        continue
+            
+            # Count frequencies and get most common
+            doc_counter = Counter(doc_ids)
+            _fallback_web_ids_cache = [doc_id for doc_id, _ in doc_counter.most_common(100)]
+        else:
+            # Ultimate fallback: use sequential IDs
+            _fallback_web_ids_cache = list(range(1, 101))
+    
+    # Return top candidates excluding already used ones
+    result = []
+    for doc_id in _fallback_web_ids_cache:
+        if doc_id not in exclude:
+            result.append(doc_id)
+            if len(result) >= count:
+                break
+    
+    # If still not enough, fill with sequential IDs
+    if len(result) < count:
+        next_id = max(_fallback_web_ids_cache) if _fallback_web_ids_cache else 1
+        while len(result) < count:
+            next_id += 1
+            if next_id not in exclude:
+                result.append(next_id)
+    
+    return result[:count]
+
 def validate_against_sample(results: Dict[int, List[int]], sample_path: Path, k_final: int) -> None:
     """Ensure submission matches the sample format (q_ids set and list length)."""
     if not sample_path.exists():
@@ -116,12 +171,25 @@ def main():
     
     # read questions
     logger.info(f"Reading questions from {questions_path}")
-    questions = read_questions(questions_path)
-    logger.info(f"Loaded {len(questions)} questions")
+    all_questions = read_questions(questions_path)
+    logger.info(f"Loaded {len(all_questions)} questions")
+    
+    # Load sample submission to get all required q_ids
+    sample_path = project_root / "sample_submission.csv"
+    required_q_ids = set()
+    if sample_path.exists():
+        with open(sample_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    required_q_ids.add(int(row["q_id"]))
+                except (ValueError, KeyError):
+                    pass
+        logger.info(f"Loaded {len(required_q_ids)} required q_ids from sample submission")
     
     # validate and clean questions
     logger.info("Validating and cleaning questions...")
-    questions, validation_stats = validate_and_clean_questions(questions)
+    questions, validation_stats = validate_and_clean_questions(all_questions)
     logger.info(
         f"Questions validation: total={validation_stats['total']}, "
         f"valid={validation_stats['valid']}, cleaned={validation_stats['cleaned']}, "
@@ -129,6 +197,19 @@ def main():
     )
     if validation_stats['removed'] > 0:
         logger.warning(f"Removed {validation_stats['removed']} invalid questions")
+    
+    # Create a map of all q_ids to queries (including removed ones for fallback)
+    all_questions_map = {q_id: query for q_id, query in all_questions}
+    
+    # Add missing q_ids from sample submission with fallback queries
+    processed_q_ids = {q_id for q_id, _ in questions}
+    missing_q_ids = required_q_ids - processed_q_ids
+    if missing_q_ids:
+        logger.warning(f"Adding {len(missing_q_ids)} missing q_ids from sample submission with fallback queries")
+        for q_id in missing_q_ids:
+            # Use original query if available, otherwise use placeholder
+            query = all_questions_map.get(q_id, " ")
+            questions.append((q_id, query))
     
     # initialize retriever
     logger.info("Initializing hybrid retriever (FAISS + FlashRAG bm25s)...")
@@ -267,6 +348,9 @@ def main():
                 k=k_retrieve,
                 return_scores=False,
             )
+            # Ensure we have candidates for all queries
+            while len(batch_candidates) < len(batch):
+                batch_candidates.append([])
         except Exception as e:
             logger.error(f"Batch retrieval failed for questions {q_ids[0]}-{q_ids[-1] if q_ids else 'N/A'}: {e}")
             batch_candidates = [[] for _ in batch]
@@ -345,35 +429,49 @@ def main():
             try:
                 candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
                 final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
-                if not final_candidates:
-                    final_candidates = candidates[:k_final] if candidates else []
                 
-                # Deduplicate by web_id: keep best chunk per document
+                # Strategy: collect unique documents first, ensuring we have at least k_final
+                # Start with reranked candidates (best quality), then use all retriever candidates
                 web_id_to_best_chunk = {}
-                for candidate in final_candidates:
-                    try:
-                        doc_id = int(candidate.get("doc_id", 0))
-                        if doc_id <= 0:
-                            continue
-                        # Keep candidate with highest score for each web_id
-                        if doc_id not in web_id_to_best_chunk:
-                            web_id_to_best_chunk[doc_id] = candidate
-                        else:
-                            current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
-                            best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
-                            if current_score > best_score:
-                                web_id_to_best_chunk[doc_id] = candidate
-                    except (ValueError, TypeError):
-                        continue
                 
-                # If we still need more, fill from original candidates
-                if len(web_id_to_best_chunk) < k_final:
+                # First pass: use reranked candidates (if available)
+                if final_candidates:
+                    for candidate in final_candidates:
+                        try:
+                            doc_id = int(candidate.get("doc_id", 0))
+                            if doc_id <= 0:
+                                continue
+                            # Keep candidate with highest score for each web_id
+                            if doc_id not in web_id_to_best_chunk:
+                                web_id_to_best_chunk[doc_id] = candidate
+                            else:
+                                current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
+                                best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
+                                if current_score > best_score:
+                                    web_id_to_best_chunk[doc_id] = candidate
+                        except (ValueError, TypeError):
+                            continue
+                
+                # Second pass: if we don't have enough unique documents, use ALL retriever candidates
+                # We have k_retrieve=180 candidates, so we should be able to get at least k_final=5 unique docs
+                if len(web_id_to_best_chunk) < k_final and candidates:
                     for candidate in candidates:
                         try:
                             doc_id = int(candidate.get("doc_id", 0))
-                            if doc_id <= 0 or doc_id in web_id_to_best_chunk:
+                            if doc_id <= 0:
                                 continue
-                            web_id_to_best_chunk[doc_id] = candidate
+                            
+                            # Add if new document, or update if better score
+                            if doc_id not in web_id_to_best_chunk:
+                                web_id_to_best_chunk[doc_id] = candidate
+                            else:
+                                # Update if this candidate has better score
+                                current_score = float(candidate.get("score", 0.0))
+                                best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
+                                if current_score > best_score:
+                                    web_id_to_best_chunk[doc_id] = candidate
+                            
+                            # Stop once we have enough unique documents
                             if len(web_id_to_best_chunk) >= k_final:
                                 break
                         except (ValueError, TypeError):
@@ -385,7 +483,7 @@ def main():
                         web_id_to_best_chunk.values(),
                         key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
                         reverse=True
-                    )[:k_final]
+                    )
                     # Safely convert doc_id to int, filtering out invalid values
                     web_ids = []
                     for c in deduped_candidates:
@@ -398,27 +496,55 @@ def main():
                 else:
                     web_ids = []
                 
-                # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
+                # If we still don't have enough unique documents, continue using more candidates
+                # This should rarely happen since we have k_retrieve=180 candidates
+                if len(web_ids) < k_final and candidates:
+                    used_web_ids = set(web_ids)
+                    additional_candidates = []
+                    
+                    # Continue through all candidates from retriever
+                    for candidate in candidates:
+                        try:
+                            doc_id = int(candidate.get("doc_id", 0))
+                            if doc_id > 0 and doc_id not in used_web_ids:
+                                additional_candidates.append((doc_id, float(candidate.get("score", 0.0))))
+                                used_web_ids.add(doc_id)
+                                if len(web_ids) + len(additional_candidates) >= k_final:
+                                    break
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    # Sort additional candidates by score and add best ones
+                    additional_candidates.sort(key=lambda x: x[1], reverse=True)
+                    for doc_id, _ in additional_candidates:
+                        if len(web_ids) >= k_final:
+                            break
+                        web_ids.append(doc_id)
+                
+                # Final fallback: if still not enough (should be extremely rare with k_retrieve=180)
                 if len(web_ids) < k_final:
-                    if web_ids:
-                        # Fill with duplicates of best web_id
-                        while len(web_ids) < k_final:
-                            web_ids.append(web_ids[0])  # Use first (best) instead of last
+                    used_web_ids = set(web_ids)
+                    fallback_web_ids = _get_fallback_web_ids(k_final - len(web_ids), used_web_ids)
+                    web_ids.extend(fallback_web_ids)
+                    
+                    if len(web_ids) == k_final:
                         logger.warning(
-                            f"Question {q_id}: Only {len(set(web_ids))} unique web_ids found, "
-                            f"filled to {k_final} with duplicates"
+                            f"Question {q_id}: Only {len(set(web_ids[:len(web_ids)-len(fallback_web_ids)]))} unique web_ids from {len(candidates)} candidates, "
+                            f"added {len(fallback_web_ids)} fallback web_ids"
                         )
                     else:
-                        # Ultimate fallback: use web_id=1
-                        web_ids = [1] * k_final
-                        logger.warning(f"Question {q_id}: No valid web_ids found, using fallback [1]*{k_final}")
+                        logger.error(
+                            f"Question {q_id}: Failed to get {k_final} unique web_ids even with fallback. "
+                            f"Got {len(web_ids)} web_ids from {len(candidates)} candidates."
+                        )
                 
                 web_ids = web_ids[:k_final]
                 batch_results[q_id] = web_ids
             except Exception as e:
                 # If processing individual question fails, use fallback
                 logger.warning(f"Failed to process question {q_id}: {e}. Using fallback.")
-                batch_results[q_id] = [1] * k_final  # Fallback: all 1s
+                fallback_web_ids = _get_fallback_web_ids(k_final, set())
+                batch_results[q_id] = fallback_web_ids
         
         return batch_results
     
@@ -472,6 +598,21 @@ def main():
     timestamp = get_timestamp()
     output_path = Path(args.output) if args.output else Path(submits_dir) / f"submit_{timestamp}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Ensure all required q_ids are in results (add fallback for missing ones)
+    sample_path = project_root / "sample_submission.csv"
+    if sample_path.exists():
+        with open(sample_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    q_id = int(row["q_id"])
+                    if q_id not in results:
+                        logger.warning(f"Missing q_id {q_id} in results, adding fallback")
+                        fallback_web_ids = _get_fallback_web_ids(k_final, set())
+                        results[q_id] = fallback_web_ids
+                except (ValueError, KeyError):
+                    pass
     
     validate_against_sample(results, project_root / "sample_submission.csv", k_final)
 

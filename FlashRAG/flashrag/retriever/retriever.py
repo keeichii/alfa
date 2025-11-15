@@ -820,6 +820,80 @@ class MultiRetrieverRouter:
                 score = None
 
             result = self.add_source(result, retriever)
+            
+            # Store scores in documents before reorder to preserve source scores
+            # This ensures each document has its source-specific score (dense_score, bm25_score)
+            if return_score and score is not None:
+                source_name = getattr(retriever, "source_name", getattr(retriever, "_source_name", retriever.retrieval_method))
+                source_score_key = f"{source_name}_score"
+                
+                def _store_scores_in_docs(docs, scores_list):
+                    """Helper to store scores in documents.
+                    
+                    This is critical: we need to store source scores in documents BEFORE reorder,
+                    so they're preserved when documents are reordered and merged.
+                    
+                    IMPORTANT: Documents from datasets may be immutable, so we need to convert
+                    them to dicts before modifying them.
+                    """
+                    if not isinstance(docs, list) or len(docs) == 0:
+                        return
+                    
+                    def _ensure_dict(doc):
+                        """Convert document to dict if it's not already."""
+                        if isinstance(doc, dict):
+                            return doc
+                        # Try to convert to dict
+                        try:
+                            return dict(doc)
+                        except (TypeError, ValueError):
+                            # If conversion fails, try to access as dict-like
+                            return {k: doc[k] for k in doc.keys()}
+                    
+                    # Check if docs is batch format: [[doc1, doc2], [doc3, doc4]]
+                    if isinstance(docs[0], list):
+                        # Batch results: [[doc1, doc2], [doc3, doc4]]
+                        for query_idx, query_docs in enumerate(docs):
+                            if query_idx < len(scores_list) and isinstance(scores_list[query_idx], list):
+                                for doc_idx, doc in enumerate(query_docs):
+                                    if doc_idx < len(scores_list[query_idx]):
+                                        # Ensure doc is a mutable dict
+                                        if not isinstance(doc, dict):
+                                            query_docs[doc_idx] = _ensure_dict(doc)
+                                            doc = query_docs[doc_idx]
+                                        score_val = float(scores_list[query_idx][doc_idx])
+                                        doc["score"] = score_val
+                                        doc[source_score_key] = score_val
+                    else:
+                        # Single query results: [doc1, doc2]
+                        if isinstance(scores_list, list) and len(scores_list) > 0:
+                            if isinstance(scores_list[0], list):
+                                # Batch scores: [[s1, s2], [s3, s4]] but single query docs
+                                # This shouldn't happen, but handle it
+                                if len(scores_list) > 0:
+                                    for doc_idx, doc in enumerate(docs):
+                                        if doc_idx < len(scores_list[0]):
+                                            # Ensure doc is a mutable dict
+                                            if not isinstance(doc, dict):
+                                                docs[doc_idx] = _ensure_dict(doc)
+                                                doc = docs[doc_idx]
+                                            score_val = float(scores_list[0][doc_idx])
+                                            doc["score"] = score_val
+                                            doc[source_score_key] = score_val
+                            else:
+                                # Single query scores: [s1, s2]
+                                for doc_idx, doc in enumerate(docs):
+                                    if doc_idx < len(scores_list):
+                                        # Ensure doc is a mutable dict
+                                        if not isinstance(doc, dict):
+                                            docs[doc_idx] = _ensure_dict(doc)
+                                            doc = docs[doc_idx]
+                                        score_val = float(scores_list[doc_idx])
+                                        doc["score"] = score_val
+                                        doc[source_score_key] = score_val
+                
+                _store_scores_in_docs(result, score)
+            
             return result, score
 
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -834,7 +908,13 @@ class MultiRetrieverRouter:
                         score_list.extend(score)
                 except Exception as e:
                     print(f"Error processing retriever {future_to_retriever[future]}: {e}")
+        
+        # Reorder results and scores
+        # IMPORTANT: After reorder, scores in documents should be preserved because they're stored as document fields
         result_list, score_list = self.reorder(result_list, score_list, retriever_list)
+        
+        # Post-process (merge) results
+        # IMPORTANT: During merge, source scores from documents should be preserved
         result_list, score_list = self.post_process_result(query, result_list, score_list, num)
         if return_score:
             return result_list, score_list
@@ -898,12 +978,13 @@ class MultiRetrieverRouter:
                 warnings.warn(
                     "Using multiple corpus may lead to conflicts in DOC IDs, which may result in incorrect rrf results!"
                 )
+            rrf_k = getattr(self, 'rrf_k', 60)  # Get RRF k parameter, default to 60
             if isinstance(result_list[0], dict):
-                result_list, score_list = self.rrf_merge([result_list], num, k=60)
+                result_list, score_list = self.rrf_merge([result_list], [score_list] if score_list else [], num, k=rrf_k)
                 result_list = result_list[0]
                 score_list = score_list[0]
             else:
-                result_list, score_list = self.rrf_merge(result_list, num, k=60)
+                result_list, score_list = self.rrf_merge(result_list, score_list, num, k=rrf_k)
             return result_list, score_list
         elif self.merge_method == "weighted":
             if isinstance(result_list[0], dict):
@@ -933,39 +1014,100 @@ class MultiRetrieverRouter:
         else:
             raise NotImplementedError
 
-    def rrf_merge(self, results, topk=10, k=60):
+    def rrf_merge(self, results, score_lists=None, topk=10, k=60):
         """
         Perform Reciprocal Rank Fusion (RRF) on retrieval results.
 
         Args:
             results (list of list of dict): Retrieval results for multiple queries.
+            score_lists (list of list of float, optional): Original scores for each document.
             topk (int): Number of top results to return per query.
             k (int): RRF hyperparameter to adjust rank contribution.
 
         Returns:
             list of list of dict: Fused results with topk highest scores per query.
         """
+        if score_lists is None:
+            score_lists = []
+        
         fused_results = []
         fused_scores = []
-        for query_results in results:
+        for query_idx, query_results in enumerate(results):
+            query_scores = score_lists[query_idx] if query_idx < len(score_lists) else []
+            
             # Initialize a score dictionary to accumulate RRF scores
             score_dict = {}
             retriever_result_dict = {}
             id2item = {}
-            for item in query_results:
-                source = item["source"]
+            # Store source scores for each document
+            id2source_scores = {}
+            id2source_ranks = {}
+            
+            # Map document index to score
+            doc_idx_to_score = {}
+            for doc_idx, item in enumerate(query_results):
+                source = item.get("source", "unknown")
+                doc_id = item["id"]
+                
                 if source not in retriever_result_dict:
                     retriever_result_dict[source] = []
-                retriever_result_dict[source].append(item["id"])
-                id2item[item["id"]] = item
+                retriever_result_dict[source].append(doc_id)
+                id2item[doc_id] = item
+                
+                # Get original score: prefer from document (with source name), then from score_list, then from generic "score"
+                # Check for source-specific score first (e.g., "dense_score", "bm25_score")
+                source_score_key = f"{source}_score"
+                original_score = 0.0
+                
+                # Priority 1: source-specific score field (e.g., "dense_score", "bm25_score")
+                # This should be set before reorder in _store_scores_in_docs
+                if source_score_key in item:
+                    original_score = float(item[source_score_key])
+                # Priority 2: try to get from source_scores dict (set in rrf_merge or weighted_merge)
+                elif "source_scores" in item and isinstance(item["source_scores"], dict):
+                    original_score = float(item["source_scores"].get(source, 0.0))
+                # Priority 3: generic "score" field (but check if it's not RRF score)
+                # IMPORTANT: After reorder, "score" might be RRF score, not original score
+                # We need to check if it looks like RRF score (very small, < 0.1)
+                elif "score" in item:
+                    score_val = float(item["score"])
+                    # RRF scores are typically small (0.01-0.02 range for k=70)
+                    # Real BM25/dense scores are usually larger or have different distribution
+                    # If score is very small (< 0.1), it's probably RRF score, skip it
+                    # If it's larger, it might be a real score from retriever
+                    if score_val > 0.1:
+                        # Might be a real score, use it
+                        original_score = score_val
+                    # Otherwise, it's probably RRF score, don't use it
+                    # We'll fall through to next priority
+                
+                # Priority 4: score from score_list (if available and in correct order)
+                # Note: after reorder, score_list order may not match document order
+                # But we can try to use it as last resort
+                if original_score == 0.0 and doc_idx < len(query_scores):
+                    # Only use score_list if we haven't found a score yet
+                    score_from_list = float(query_scores[doc_idx])
+                    # Check if it looks like RRF score
+                    if score_from_list > 0.1:
+                        original_score = score_from_list
+                
+                # Store original score from this source
+                if doc_id not in id2source_scores:
+                    id2source_scores[doc_id] = {}
+                    id2source_ranks[doc_id] = {}
+                id2source_scores[doc_id][source] = original_score
 
-            # Calculate RRF scores for each document
+            # Calculate RRF scores for each document and store ranks
             for retriever, retriever_result in retriever_result_dict.items():
                 for rank, doc_id in enumerate(retriever_result, start=1):
                     if doc_id not in score_dict:
                         score_dict[doc_id] = 0
                     # Add RRF score for the document
                     score_dict[doc_id] += 1 / (k + rank)
+                    # Store rank for this source
+                    if doc_id not in id2source_ranks:
+                        id2source_ranks[doc_id] = {}
+                    id2source_ranks[doc_id][retriever] = rank
 
             # Sort by accumulated RRF score
             sorted_results = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
@@ -974,7 +1116,36 @@ class MultiRetrieverRouter:
             top_ids = [i[0] for i in sorted_results[:topk]]
             top_scores = [i[1] for i in sorted_results[:topk]]
 
-            fused_results.append([id2item[id] for id in top_ids])
+            # Build fused results with source scores
+            fused_docs = []
+            for doc_id, rrf_score in zip(top_ids, top_scores):
+                original_doc = id2item[doc_id]
+                doc = dict(original_doc)  # Copy document to preserve all fields
+                doc["score"] = float(rrf_score)  # Set RRF score
+                doc["rrf_score"] = float(rrf_score)  # Also store as rrf_score for clarity
+                
+                # Add source scores if available from id2source_scores (collected above)
+                if doc_id in id2source_scores:
+                    doc["source_scores"] = {src: float(val) for src, val in id2source_scores[doc_id].items()}
+                    # Add individual source score fields (e.g., "dense_score", "bm25_score")
+                    for src, val in id2source_scores[doc_id].items():
+                        doc[f"{src}_score"] = float(val)
+                else:
+                    # Fallback: try to preserve source scores from original document if they exist
+                    # This can happen if source scores were stored in documents before reorder
+                    if "source_scores" in original_doc:
+                        doc["source_scores"] = dict(original_doc["source_scores"])
+                    else:
+                        doc["source_scores"] = {}
+                    
+                    # Preserve individual source score fields if they exist in original document
+                    for src_key in ["dense_score", "bm25_score"]:
+                        if src_key in original_doc:
+                            doc[src_key] = float(original_doc[src_key])
+                
+                fused_docs.append(doc)
+            
+            fused_results.append(fused_docs)
             fused_scores.append(top_scores)
 
         return fused_results, fused_scores
