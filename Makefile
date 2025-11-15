@@ -23,6 +23,7 @@ help:
 	@echo "  make submit            - Step 8: Generate submit.csv for submission"
 	@echo ""
 	@echo "Utilities:"
+	@echo "  make test_small        - Test pipeline on first 10 questions (quick validation)"
 	@echo "  make check_ground_truth - Check consistency between questions and ground truth"
 	@echo "  make clean_corpus      - Clean corpus.jsonl and rejected log"
 	@echo "  make clean_chunks      - Clean chunks.jsonl"
@@ -118,6 +119,12 @@ clean_indexes:
 	rm -rf indexes/faiss/*
 	rm -rf indexes/bm25/*
 	@echo "Indexes cleaned"
+
+# Test small subset (requires indexes to be built)
+test_small: build_index
+	@echo "=== Testing pipeline on first 10 questions ==="
+	python scripts/test_small.py --config $(CONFIG)
+	@echo "Small test complete."
 
 # Full clean
 clean: clean_corpus clean_chunks clean_indexes

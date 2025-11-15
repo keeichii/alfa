@@ -375,16 +375,27 @@ class BM25Retriever(BaseTextRetriever):
 
             # Use the same tokenizer that was used for indexing
             query_tokens = self.tokenizer.tokenize(query, return_as='tuple')
-            raw_results, raw_scores = self.searcher.retrieve(query_tokens, k=num)
-            normalized_results = []
-            normalized_scores = []
-            for doc_indices, doc_scores in zip(raw_results, raw_scores):
-                idxs = list(doc_indices)
-                scores = [float(s) for s in list(doc_scores)]
-                docs = self._materialize_results(idxs, scores)
-                normalized_results.append(docs)
-                normalized_scores.append(scores)
-            results, scores = normalized_results, normalized_scores
+            
+            # DEBUG: Check if query_tokens are empty (this would cause scores = 0.0)
+            # If query is empty or tokenization fails, we'll get empty tokens
+            # and BM25 will return scores = 0.0 for all documents
+            if not query_tokens or (isinstance(query_tokens, list) and len(query_tokens) > 0 and 
+                                   (not query_tokens[0] or len(query_tokens[0]) == 0)):
+                # Empty tokens - return empty results with zero scores
+                # This can happen if query is empty or tokenization removes all tokens
+                results = [[] for _ in query]
+                scores = [[0.0] * num for _ in query]
+            else:
+                raw_results, raw_scores = self.searcher.retrieve(query_tokens, k=num)
+                normalized_results = []
+                normalized_scores = []
+                for doc_indices, doc_scores in zip(raw_results, raw_scores):
+                    idxs = list(doc_indices)
+                    scores_list = [float(s) for s in list(doc_scores)]
+                    docs = self._materialize_results(idxs, scores_list)
+                    normalized_results.append(docs)
+                    normalized_scores.append(scores_list)
+                results, scores = normalized_results, normalized_scores
         else:
             assert False, "Invalid bm25 backend!"
         if return_score:
@@ -750,7 +761,7 @@ class MultiRetrieverRouter:
 
         def _normalize(doc):
             if isinstance(doc, dict):
-                normalized = dict(doc)
+                normalized = dict(doc)  # This copies all fields including bm25_score, dense_score, etc.
             else:
                 try:
                     keys = doc.keys()
@@ -771,17 +782,19 @@ class MultiRetrieverRouter:
             if doc_id is None:
                 doc_id = chunk_id.split("_")[0] if isinstance(chunk_id, str) and "_" in chunk_id else chunk_id
             contents = normalized.get("contents") or normalized.get("text") or ""
+            # CRITICAL: Use update() instead of creating new dict to preserve all existing fields
+            # including bm25_score, dense_score, score, etc. that were set by _materialize_results
             normalized.update(
                 {
                     "id": chunk_id,
                     "chunk_id": chunk_id,
                     "doc_id": str(doc_id),
                     "contents": contents,
+                    "source": source_name,
+                    "corpus_path": corpus_path,
+                    "is_multimodal": is_multimodal,
                 }
             )
-            normalized["source"] = source_name
-            normalized["corpus_path"] = corpus_path
-            normalized["is_multimodal"] = is_multimodal
             return normalized
 
         if isinstance(result, (list, tuple)):
@@ -835,8 +848,20 @@ class MultiRetrieverRouter:
                     
                     IMPORTANT: Documents from datasets may be immutable, so we need to convert
                     them to dicts before modifying them.
+                    
+                    CRITICAL: For BM25, documents may already have bm25_score from _materialize_results.
+                    We should preserve it if it exists and is valid, otherwise use the score from scores_list.
+                    
+                    CRITICAL FIX: scores_list is the authoritative source - it comes directly from
+                    bm25s.retrieve() or dense retriever. We MUST use it if it's available and non-zero.
                     """
                     if not isinstance(docs, list) or len(docs) == 0:
+                        return
+                    
+                    # DEBUG: Log if scores_list is empty or None
+                    if scores_list is None or (isinstance(scores_list, list) and len(scores_list) == 0):
+                        # If scores_list is empty, try to preserve existing scores from docs
+                        # This should rarely happen, but handle it gracefully
                         return
                     
                     def _ensure_dict(doc):
@@ -861,9 +886,24 @@ class MultiRetrieverRouter:
                                         if not isinstance(doc, dict):
                                             query_docs[doc_idx] = _ensure_dict(doc)
                                             doc = query_docs[doc_idx]
-                                        score_val = float(scores_list[query_idx][doc_idx])
+                                        
+                                        # Get score from scores_list (this is the authoritative source)
+                                        # scores_list comes directly from bm25s.retrieve() or dense retriever
+                                        score_from_list = float(scores_list[query_idx][doc_idx])
+                                        
+                                        # CRITICAL: scores_list is ALWAYS authoritative - it comes from the retriever
+                                        # We MUST use it, even if it's 0.0 (which indicates no match)
+                                        # Only exception: if scores_list is somehow corrupted or empty, fall back to doc
+                                        score_val = score_from_list
+                                        
+                                        # Set both generic score and source-specific score
                                         doc["score"] = score_val
                                         doc[source_score_key] = score_val
+                                        
+                                        # Also preserve in source_scores dict if it exists
+                                        if "source_scores" not in doc:
+                                            doc["source_scores"] = {}
+                                        doc["source_scores"][source_name] = score_val
                     else:
                         # Single query results: [doc1, doc2]
                         if isinstance(scores_list, list) and len(scores_list) > 0:
@@ -877,9 +917,19 @@ class MultiRetrieverRouter:
                                             if not isinstance(doc, dict):
                                                 docs[doc_idx] = _ensure_dict(doc)
                                                 doc = docs[doc_idx]
-                                            score_val = float(scores_list[0][doc_idx])
+                                            
+                                            score_from_list = float(scores_list[0][doc_idx])
+                                            
+                                            # CRITICAL: scores_list is authoritative - always use it
+                                            score_val = score_from_list
+                                            
                                             doc["score"] = score_val
                                             doc[source_score_key] = score_val
+                                            
+                                            # Also preserve in source_scores dict if it exists
+                                            if "source_scores" not in doc:
+                                                doc["source_scores"] = {}
+                                            doc["source_scores"][source_name] = score_val
                             else:
                                 # Single query scores: [s1, s2]
                                 for doc_idx, doc in enumerate(docs):
@@ -888,9 +938,19 @@ class MultiRetrieverRouter:
                                         if not isinstance(doc, dict):
                                             docs[doc_idx] = _ensure_dict(doc)
                                             doc = docs[doc_idx]
-                                        score_val = float(scores_list[doc_idx])
+                                        
+                                        score_from_list = float(scores_list[doc_idx])
+                                        
+                                        # CRITICAL: scores_list is authoritative - always use it
+                                        score_val = score_from_list
+                                        
                                         doc["score"] = score_val
                                         doc[source_score_key] = score_val
+                                        
+                                        # Also preserve in source_scores dict if it exists
+                                        if "source_scores" not in doc:
+                                            doc["source_scores"] = {}
+                                        doc["source_scores"][source_name] = score_val
                 
                 _store_scores_in_docs(result, score)
             

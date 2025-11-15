@@ -323,7 +323,70 @@ class HybridRetriever:
             return candidate
         return self.bm25_index_dir
 
-    def _to_candidate(self, doc: Dict[str, Any], fallback_score: Optional[float]) -> Dict[str, Any]:
+    def _compute_title_text_scores(self, doc: Dict[str, Any], query: str) -> tuple[float, float]:
+        """
+        Compute separate scores for title and text portions of the document.
+        
+        Returns:
+            (title_score, text_score) - scores for title and text portions
+        """
+        title = doc.get("title", "").strip()
+        text = doc.get("text", "").strip()
+        contents = doc.get("contents", "").strip()
+        
+        # If contents is in format "title\ntext", split it
+        if not title and contents:
+            parts = contents.split("\n", 1)
+            if len(parts) == 2:
+                title = parts[0].strip()
+                text = parts[1].strip()
+            else:
+                text = contents
+        
+        # Get base scores
+        source_scores = doc.get("source_scores", {})
+        dense_score = float(doc.get("dense_score", source_scores.get("dense", 0.0)))
+        bm25_score = float(doc.get("bm25_score", source_scores.get("bm25", 0.0)))
+        base_score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else 0.0
+        
+        if not query or base_score == 0.0:
+            return (0.0, 0.0)
+        
+        # Simple heuristic: check query term overlap with title vs text
+        query_lower = query.lower()
+        query_terms = set(query_lower.split())
+        
+        title_lower = title.lower() if title else ""
+        text_lower = text.lower() if text else ""
+        
+        # Count matching terms
+        title_matches = sum(1 for term in query_terms if term in title_lower) if title_lower else 0
+        text_matches = sum(1 for term in query_terms if term in text_lower) if text_lower else 0
+        
+        total_terms = len(query_terms)
+        if total_terms == 0:
+            return (base_score * 0.5, base_score * 0.5)
+        
+        # Compute title and text scores based on term overlap
+        title_ratio = title_matches / total_terms if total_terms > 0 else 0.0
+        text_ratio = text_matches / total_terms if total_terms > 0 else 0.0
+        
+        # Normalize ratios (if both are 0, split evenly)
+        total_ratio = title_ratio + text_ratio
+        if total_ratio == 0:
+            title_ratio = 0.5
+            text_ratio = 0.5
+        else:
+            title_ratio = title_ratio / total_ratio
+            text_ratio = text_ratio / total_ratio
+        
+        # Apply base score with ratios
+        title_score = base_score * title_ratio
+        text_score = base_score * text_ratio
+        
+        return (title_score, text_score)
+
+    def _to_candidate(self, doc: Dict[str, Any], fallback_score: Optional[float] = None, query: Optional[str] = None) -> Dict[str, Any]:
         chunk_id = str(
             doc.get(
                 "chunk_id",
@@ -348,6 +411,12 @@ class HybridRetriever:
         dense_score = float(doc.get("dense_score", source_scores.get("dense", 0.0)))
         bm25_score = float(doc.get("bm25_score", source_scores.get("bm25", 0.0)))
         
+        # Compute separate title and text scores if query is available
+        title_score = 0.0
+        text_score = 0.0
+        if query:
+            title_score, text_score = self._compute_title_text_scores(doc, query)
+        
         # For display/logging: prioritize original source scores over RRF score
         # RRF scores look like 1/(k+rank) and are typically 0.01-0.02 range
         # Real BM25/dense scores are usually different (can be larger or have different distribution)
@@ -357,23 +426,39 @@ class HybridRetriever:
         # RRF scores are rank-based and don't reflect actual relevance
         if dense_score > 0 or bm25_score > 0:
             # We have real source scores - use max of them for primary display
-            score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else None
+            base_score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else None
         elif rrf_score is not None:
             # No source scores available, use RRF score
             rrf_score = float(rrf_score)
             # Check if RRF score looks like rank-based (very small, around 0.01-0.02)
             if rrf_score < 0.1:
                 # This is likely RRF score, but we have no source scores, so use it
-                score = rrf_score
+                base_score = rrf_score
             else:
                 # Might be a real score, use it
-                score = rrf_score
+                base_score = rrf_score
         else:
             # No scores available, use fallback
-            score = fallback_score
+            base_score = fallback_score
         
-        if score is None:
-            score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else (fallback_score or 0.0)
+        if base_score is None:
+            base_score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else (fallback_score or 0.0)
+        base_score = float(base_score or 0.0)
+        
+        # IMPORTANT: Combine title and text scores with title having higher weight (2:1 ratio)
+        # If we computed separate scores, use weighted combination
+        if query and (title_score > 0 or text_score > 0):
+            # Title weight: 2.0, Text weight: 1.0
+            # Normalize to ensure title has priority
+            total_weight = 2.0 + 1.0
+            score = (title_score * 2.0 + text_score * 1.0) / total_weight
+            # If combined score is too low, fall back to base_score
+            if score < base_score * 0.1:
+                score = base_score
+        else:
+            # No query or no separate scores, use base score
+            score = base_score
+        
         score = float(score or 0.0)
 
         candidate = {
