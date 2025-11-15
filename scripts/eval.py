@@ -343,6 +343,8 @@ def main():
             
             if queries_with_gt > 0:
                 recall_at_50_before_rerank /= queries_with_gt
+            else:
+                recall_at_50_before_rerank = 0.0
                 logger.info(
                     f"Diagnostic (first batch): Recall@50 before rerank = {recall_at_50_before_rerank:.4f} "
                     f"(computed over {queries_with_gt} queries with ground truth)"

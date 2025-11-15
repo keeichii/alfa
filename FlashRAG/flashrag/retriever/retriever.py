@@ -376,21 +376,37 @@ class BM25Retriever(BaseTextRetriever):
             # Use the same tokenizer that was used for indexing
             query_tokens = self.tokenizer.tokenize(query, return_as='tuple')
             
-            # DEBUG: Check if query_tokens are empty (this would cause scores = 0.0)
+            # CRITICAL: Check if query_tokens are empty (this would cause scores = 0.0)
             # If query is empty or tokenization fails, we'll get empty tokens
             # and BM25 will return scores = 0.0 for all documents
-            if not query_tokens or (isinstance(query_tokens, list) and len(query_tokens) > 0 and 
-                                   (not query_tokens[0] or len(query_tokens[0]) == 0)):
+            # This is a common issue when queries are over-normalized or tokenized incorrectly
+            has_empty_tokens = False
+            if not query_tokens:
+                has_empty_tokens = True
+            elif isinstance(query_tokens, list) and len(query_tokens) > 0:
+                # Check if first query has empty tokens
+                if not query_tokens[0] or (isinstance(query_tokens[0], (list, tuple)) and len(query_tokens[0]) == 0):
+                    has_empty_tokens = True
+                elif isinstance(query_tokens[0], (list, tuple)) and all(not token or len(token) == 0 for token in query_tokens[0]):
+                    has_empty_tokens = True
+            
+            if has_empty_tokens:
                 # Empty tokens - return empty results with zero scores
                 # This can happen if query is empty or tokenization removes all tokens
+                # WARNING: This will result in bm25_score = 0.0 for all documents
                 results = [[] for _ in query]
                 scores = [[0.0] * num for _ in query]
             else:
+                # CRITICAL: Retrieve results and scores from bm25s
+                # raw_scores should contain actual BM25 scores (typically > 0 for relevant documents)
                 raw_results, raw_scores = self.searcher.retrieve(query_tokens, k=num)
                 normalized_results = []
                 normalized_scores = []
                 for doc_indices, doc_scores in zip(raw_results, raw_scores):
                     idxs = list(doc_indices)
+                    # CRITICAL: Convert scores to float - these are the actual BM25 scores
+                    # If these are all 0.0, it means bm25s.retrieve() returned 0.0 for all documents
+                    # This should NOT happen for valid queries with non-empty tokens
                     scores_list = [float(s) for s in list(doc_scores)]
                     docs = self._materialize_results(idxs, scores_list)
                     normalized_results.append(docs)
@@ -760,14 +776,20 @@ class MultiRetrieverRouter:
         is_multimodal = isinstance(retriever, MultiModalRetriever)
 
         def _normalize(doc):
+            # CRITICAL: Preserve ALL fields from original document, especially scores
+            # Documents may already have bm25_score, dense_score, score, source_scores, etc.
+            # We MUST preserve these fields when normalizing
             if isinstance(doc, dict):
-                normalized = dict(doc)  # This copies all fields including bm25_score, dense_score, etc.
+                # Use dict(doc) to create a shallow copy - this preserves all fields
+                normalized = dict(doc)
             else:
                 try:
                     keys = doc.keys()
                     normalized = {k: doc[k] for k in keys}
                 except Exception:
                     normalized = {"id": str(doc)}
+            
+            # Extract and normalize standard fields
             chunk_id = str(
                 normalized.get(
                     "chunk_id",
@@ -782,8 +804,9 @@ class MultiRetrieverRouter:
             if doc_id is None:
                 doc_id = chunk_id.split("_")[0] if isinstance(chunk_id, str) and "_" in chunk_id else chunk_id
             contents = normalized.get("contents") or normalized.get("text") or ""
-            # CRITICAL: Use update() instead of creating new dict to preserve all existing fields
-            # including bm25_score, dense_score, score, etc. that were set by _materialize_results
+            
+            # CRITICAL: Use update() to ADD/OVERRIDE fields while preserving all existing ones
+            # This ensures bm25_score, dense_score, score, source_scores, etc. are NOT lost
             normalized.update(
                 {
                     "id": chunk_id,
@@ -795,6 +818,7 @@ class MultiRetrieverRouter:
                     "is_multimodal": is_multimodal,
                 }
             )
+            # All other fields (including bm25_score, dense_score, score, source_scores) are preserved
             return normalized
 
         if isinstance(result, (list, tuple)):
@@ -832,10 +856,9 @@ class MultiRetrieverRouter:
                 result = output
                 score = None
 
-            result = self.add_source(result, retriever)
-            
-            # Store scores in documents before reorder to preserve source scores
-            # This ensures each document has its source-specific score (dense_score, bm25_score)
+            # CRITICAL FIX: Store scores in documents BEFORE add_source
+            # This ensures scores are preserved even if add_source modifies document structure
+            # The scores_list from batch_search is authoritative and must be stored first
             if return_score and score is not None:
                 source_name = getattr(retriever, "source_name", getattr(retriever, "_source_name", retriever.retrieval_method))
                 source_score_key = f"{source_name}_score"
@@ -858,10 +881,12 @@ class MultiRetrieverRouter:
                     if not isinstance(docs, list) or len(docs) == 0:
                         return
                     
-                    # DEBUG: Log if scores_list is empty or None
-                    if scores_list is None or (isinstance(scores_list, list) and len(scores_list) == 0):
-                        # If scores_list is empty, try to preserve existing scores from docs
-                        # This should rarely happen, but handle it gracefully
+                    # CRITICAL: Check if scores_list is valid
+                    if scores_list is None:
+                        # scores_list is None - cannot store scores
+                        return
+                    if isinstance(scores_list, list) and len(scores_list) == 0:
+                        # scores_list is empty - cannot store scores
                         return
                     
                     def _ensure_dict(doc):
@@ -891,12 +916,30 @@ class MultiRetrieverRouter:
                                         # scores_list comes directly from bm25s.retrieve() or dense retriever
                                         score_from_list = float(scores_list[query_idx][doc_idx])
                                         
-                                        # CRITICAL: scores_list is ALWAYS authoritative - it comes from the retriever
-                                        # We MUST use it, even if it's 0.0 (which indicates no match)
-                                        # Only exception: if scores_list is somehow corrupted or empty, fall back to doc
-                                        score_val = score_from_list
+                                        # CRITICAL FIX: For BM25, documents may already have bm25_score from _materialize_results
+                                        # We should prefer scores_list if it's non-zero, but preserve existing score if scores_list is 0.0
+                                        # This handles cases where _materialize_results already set a valid score
+                                        # Also handle sentinel values from FAISS (minimum float32)
+                                        if score_from_list <= -3.4e38:
+                                            # Sentinel value from FAISS - document not found by dense retriever
+                                            # Don't set it, preserve existing score if available
+                                            if source_score_key in doc and doc[source_score_key] != 0.0:
+                                                score_val = float(doc[source_score_key])
+                                            else:
+                                                # No existing score, skip setting sentinel - don't set the field
+                                                # This means document wasn't found by this retriever
+                                                continue
+                                        elif source_score_key in doc and doc[source_score_key] != 0.0 and score_from_list == 0.0:
+                                            # Existing score is non-zero, but scores_list is 0.0 - preserve existing score
+                                            # This can happen if scores_list order doesn't match or if there's a bug
+                                            score_val = float(doc[source_score_key])
+                                        else:
+                                            # Use score from scores_list (authoritative source from retriever)
+                                            # CRITICAL: Even if score_from_list is 0.0, we should set it (0.0 means no match, but still a score)
+                                            score_val = score_from_list
                                         
-                                        # Set both generic score and source-specific score
+                                        # CRITICAL: Always set the score, even if it's 0.0 (0.0 is a valid score meaning "no match")
+                                        # This ensures bm25_score and dense_score are always present in documents
                                         doc["score"] = score_val
                                         doc[source_score_key] = score_val
                                         
@@ -904,6 +947,15 @@ class MultiRetrieverRouter:
                                         if "source_scores" not in doc:
                                             doc["source_scores"] = {}
                                         doc["source_scores"][source_name] = score_val
+                                        
+                        # DEBUG: Log first few scores to verify they're being set
+                        if query_idx == 0 and doc_idx < 3:
+                            import logging
+                            debug_logger = logging.getLogger("flashrag.retriever")
+                            debug_logger.info(  # Changed to INFO for visibility
+                                f"DEBUG: Set {source_score_key}={score_val} for doc {doc.get('chunk_id', 'N/A')} "
+                                f"(query_idx={query_idx}, doc_idx={doc_idx}, source_name={source_name})"
+                            )
                     else:
                         # Single query results: [doc1, doc2]
                         if isinstance(scores_list, list) and len(scores_list) > 0:
@@ -920,8 +972,17 @@ class MultiRetrieverRouter:
                                             
                                             score_from_list = float(scores_list[0][doc_idx])
                                             
-                                            # CRITICAL: scores_list is authoritative - always use it
-                                            score_val = score_from_list
+                                            # CRITICAL FIX: Handle sentinel values and preserve existing scores
+                                            if score_from_list <= -3.4e38:
+                                                # Sentinel value - skip it
+                                                if source_score_key in doc and doc[source_score_key] != 0.0:
+                                                    score_val = float(doc[source_score_key])
+                                                else:
+                                                    continue
+                                            elif source_score_key in doc and doc[source_score_key] != 0.0 and score_from_list == 0.0:
+                                                score_val = float(doc[source_score_key])
+                                            else:
+                                                score_val = score_from_list
                                             
                                             doc["score"] = score_val
                                             doc[source_score_key] = score_val
@@ -941,8 +1002,17 @@ class MultiRetrieverRouter:
                                         
                                         score_from_list = float(scores_list[doc_idx])
                                         
-                                        # CRITICAL: scores_list is authoritative - always use it
-                                        score_val = score_from_list
+                                        # CRITICAL FIX: Handle sentinel values and preserve existing scores
+                                        if score_from_list <= -3.4e38:
+                                            # Sentinel value - skip it
+                                            if source_score_key in doc and doc[source_score_key] != 0.0:
+                                                score_val = float(doc[source_score_key])
+                                            else:
+                                                continue
+                                        elif source_score_key in doc and doc[source_score_key] != 0.0 and score_from_list == 0.0:
+                                            score_val = float(doc[source_score_key])
+                                        else:
+                                            score_val = score_from_list
                                         
                                         doc["score"] = score_val
                                         doc[source_score_key] = score_val
@@ -952,6 +1022,50 @@ class MultiRetrieverRouter:
                                             doc["source_scores"] = {}
                                         doc["source_scores"][source_name] = score_val
                 
+                # CRITICAL: Store scores in documents BEFORE add_source
+                # This ensures scores from batch_search are preserved even if add_source modifies documents
+                # DEBUG: Log source_name to verify it's correct
+                import logging
+                debug_logger = logging.getLogger("flashrag.retriever")
+                debug_logger.info(  # Changed to INFO for visibility
+                    f"DEBUG: Storing scores for source_name={source_name}, "
+                    f"source_score_key={source_score_key}, "
+                    f"score type={type(score)}, score length={len(score) if isinstance(score, list) else 'N/A'}"
+                )
+                # Check if result has documents and if scores_list has values
+                if result and len(result) > 0:
+                    if isinstance(result[0], list):
+                        sample_doc = result[0][0] if len(result[0]) > 0 else None
+                    else:
+                        sample_doc = result[0] if len(result) > 0 else None
+                    if sample_doc:
+                        debug_logger.info(  # Changed to INFO for visibility
+                            f"DEBUG: Sample doc before _store_scores_in_docs: "
+                            f"has {source_score_key}={source_score_key in sample_doc}, "
+                            f"value={sample_doc.get(source_score_key, 'N/A')}"
+                        )
+                _store_scores_in_docs(result, score)
+                # Check after storing
+                if result and len(result) > 0:
+                    if isinstance(result[0], list):
+                        sample_doc = result[0][0] if len(result[0]) > 0 else None
+                    else:
+                        sample_doc = result[0] if len(result) > 0 else None
+                    if sample_doc:
+                        debug_logger.info(  # Changed to INFO for visibility
+                            f"DEBUG: Sample doc after _store_scores_in_docs: "
+                            f"has {source_score_key}={source_score_key in sample_doc}, "
+                            f"value={sample_doc.get(source_score_key, 'N/A')}"
+                        )
+            
+            # Now add source information to documents
+            # add_source should preserve all existing fields including bm25_score that we just set
+            result = self.add_source(result, retriever)
+            
+            # CRITICAL: After add_source, verify that scores are still present
+            # If scores were lost, re-store them (add_source should preserve them, but double-check)
+            if return_score and score is not None:
+                # Re-store scores after add_source to ensure they're not lost
                 _store_scores_in_docs(result, score)
             
             return result, score
@@ -1121,8 +1235,18 @@ class MultiRetrieverRouter:
                 
                 # Priority 1: source-specific score field (e.g., "dense_score", "bm25_score")
                 # This should be set before reorder in _store_scores_in_docs
+                # CRITICAL: Handle sentinel values and preserve real scores
                 if source_score_key in item:
-                    original_score = float(item[source_score_key])
+                    score_raw = item[source_score_key]
+                    # Check for sentinel values (minimum float32 = -3.4028234663852886e+38)
+                    if isinstance(score_raw, (int, float)) and score_raw <= -3.4e38:
+                        # Sentinel value - document not found by this retriever
+                        # Don't use it, will fall through to other priorities
+                        original_score = 0.0
+                    else:
+                        original_score = float(score_raw)
+                        # CRITICAL: If bm25_score is 0.0, it might mean it wasn't set correctly
+                        # But we should still use it if it exists (0.0 is a valid score for no match)
                 # Priority 2: try to get from source_scores dict (set in rrf_merge or weighted_merge)
                 elif "source_scores" in item and isinstance(item["source_scores"], dict):
                     original_score = float(item["source_scores"].get(source, 0.0))
@@ -1186,10 +1310,18 @@ class MultiRetrieverRouter:
                 
                 # Add source scores if available from id2source_scores (collected above)
                 if doc_id in id2source_scores:
-                    doc["source_scores"] = {src: float(val) for src, val in id2source_scores[doc_id].items()}
+                    doc["source_scores"] = {}
                     # Add individual source score fields (e.g., "dense_score", "bm25_score")
+                    # CRITICAL: Filter out sentinel values and 0.0 scores that indicate "not found"
                     for src, val in id2source_scores[doc_id].items():
-                        doc[f"{src}_score"] = float(val)
+                        # Skip sentinel values (minimum float32)
+                        if isinstance(val, (int, float)) and val <= -3.4e38:
+                            # Don't set sentinel value - document wasn't found by this retriever
+                            continue
+                        # Store non-sentinel scores
+                        score_val = float(val)
+                        doc["source_scores"][src] = score_val
+                        doc[f"{src}_score"] = score_val
                 else:
                     # Fallback: try to preserve source scores from original document if they exist
                     # This can happen if source scores were stored in documents before reorder
@@ -1199,9 +1331,27 @@ class MultiRetrieverRouter:
                         doc["source_scores"] = {}
                     
                     # Preserve individual source score fields if they exist in original document
+                    # CRITICAL: Handle sentinel values (e.g., -3.4028234663852886e+38 for missing dense_score)
+                    # Also preserve scores from source_scores dict if they exist
                     for src_key in ["dense_score", "bm25_score"]:
+                        # First, try to get from original document
                         if src_key in original_doc:
-                            doc[src_key] = float(original_doc[src_key])
+                            score_val = float(original_doc[src_key])
+                            # Check if it's the sentinel value (minimum float32)
+                            if score_val <= -3.4e38:
+                                # Don't set sentinel value - leave field absent
+                                # This indicates document wasn't found by this retriever
+                                continue
+                            else:
+                                doc[src_key] = score_val
+                        # If not in original doc, try to get from source_scores dict
+                        elif "source_scores" in original_doc and isinstance(original_doc["source_scores"], dict):
+                            # Extract source name from key (e.g., "dense_score" -> "dense")
+                            src_name = src_key.replace("_score", "")
+                            if src_name in original_doc["source_scores"]:
+                                score_val = float(original_doc["source_scores"][src_name])
+                                if score_val > -3.4e38:  # Not a sentinel
+                                    doc[src_key] = score_val
                 
                 fused_docs.append(doc)
             

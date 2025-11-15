@@ -145,6 +145,9 @@ class HybridRetriever:
 
         for idx, docs in enumerate(results):
             raw_scores: List[float] = []
+            # CRITICAL: score_lists from router.batch_search after RRF merge contains RRF scores, not source scores
+            # Source scores should already be in documents (bm25_score, dense_score fields)
+            # But we can use score_lists as fallback for the primary score
             if idx < len(score_lists):
                 candidate_scores = score_lists[idx]
                 if isinstance(candidate_scores, list):
@@ -154,7 +157,23 @@ class HybridRetriever:
             original_query = queries[idx] if idx < len(queries) else ""
             is_numeric_query = self._is_numeric_query(original_query)
             
+            # DEBUG: Check if documents have source scores before processing
+            if docs and len(docs) > 0:
+                sample_doc = docs[0]
+                has_bm25 = "bm25_score" in sample_doc
+                has_dense = "dense_score" in sample_doc
+                has_source_scores = "source_scores" in sample_doc
+                logger.debug(
+                    f"Query {idx}: Sample doc has bm25_score={has_bm25}, "
+                    f"dense_score={has_dense}, source_scores={has_source_scores}"
+                )
+                if has_bm25:
+                    logger.debug(f"  Sample bm25_score value: {sample_doc.get('bm25_score')}")
+                if has_dense:
+                    logger.debug(f"  Sample dense_score value: {sample_doc.get('dense_score')}")
+            
             for doc_idx, doc in enumerate(docs[:topk]):
+                # CRITICAL: Use RRF score from score_lists as fallback, but prefer source scores from doc
                 fallback_score = raw_scores[doc_idx] if doc_idx < len(raw_scores) else None
                 # Use original query (before normalization) for title/text scoring
                 candidate = self._to_candidate(doc, fallback_score, query=original_query)
@@ -233,7 +252,10 @@ class HybridRetriever:
                 if cleaned_query and cleaned_query.strip():
                     prepared.append(cleaned_query.strip())
                 else:
-                    prepared.append(" ")  # Ultimate fallback
+                    # CRITICAL FIX: Use a non-empty, non-whitespace placeholder if all else fails
+                    # A single space " " can be tokenized into empty tokens by some tokenizers,
+                    # leading to bm25_score = 0.0. Use a known valid token or a short, generic word.
+                    prepared.append("запрос")  # Use a generic Russian word as ultimate fallback
             else:
                 prepared.append(normalized.strip())
         return prepared
@@ -408,8 +430,31 @@ class HybridRetriever:
             source_scores = {}
 
         # Get source scores - prefer from document fields, then from source_scores dict
-        dense_score = float(doc.get("dense_score", source_scores.get("dense", 0.0)))
-        bm25_score = float(doc.get("bm25_score", source_scores.get("bm25", 0.0)))
+        # CRITICAL: Handle sentinel values (e.g., -3.4028234663852886e+38 for missing dense_score)
+        # If dense_score is the minimum float32 value, it means the document wasn't found by dense retriever
+        dense_score_raw = doc.get("dense_score", source_scores.get("dense", None))
+        if dense_score_raw is not None:
+            dense_score_float = float(dense_score_raw)
+            # Check if it's the sentinel value (minimum float32)
+            if dense_score_float <= -3.4e38:
+                dense_score = None  # Document not found by dense retriever
+            else:
+                dense_score = dense_score_float
+        else:
+            dense_score = None
+        
+        bm25_score_raw = doc.get("bm25_score", source_scores.get("bm25", None))
+        # CRITICAL: Handle 0.0 as a valid score (means no match, but still a score)
+        # Only treat None/absent as "not found"
+        if bm25_score_raw is not None:
+            bm25_score_float = float(bm25_score_raw)
+            # Check for sentinel values
+            if bm25_score_float <= -3.4e38:
+                bm25_score = None  # Sentinel value - document not found
+            else:
+                bm25_score = bm25_score_float  # 0.0 is valid (no match, but still a score)
+        else:
+            bm25_score = None
         
         # Compute separate title and text scores if query is available
         title_score = 0.0
@@ -424,11 +469,24 @@ class HybridRetriever:
         
         # CRITICAL: If we have real source scores, use them for display
         # RRF scores are rank-based and don't reflect actual relevance
-        if dense_score > 0 or bm25_score > 0:
-            # We have real source scores - use max of them for primary display
-            base_score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else None
-        elif rrf_score is not None:
-            # No source scores available, use RRF score
+        # Handle None values properly (documents not found by a specific retriever)
+        if dense_score is not None and dense_score > 0:
+            base_score = dense_score
+        elif bm25_score is not None and bm25_score > 0:
+            base_score = bm25_score
+        elif dense_score is not None or bm25_score is not None:
+            # At least one score exists, but might be 0.0
+            base_score = max(
+                dense_score if dense_score is not None else 0.0,
+                bm25_score if bm25_score is not None else 0.0
+            )
+            if base_score <= 0:
+                base_score = None
+        else:
+            base_score = None
+        
+        # If no source scores available, try RRF score
+        if base_score is None and rrf_score is not None:
             rrf_score = float(rrf_score)
             # Check if RRF score looks like rank-based (very small, around 0.01-0.02)
             if rrf_score < 0.1:
@@ -437,12 +495,10 @@ class HybridRetriever:
             else:
                 # Might be a real score, use it
                 base_score = rrf_score
-        else:
-            # No scores available, use fallback
-            base_score = fallback_score
         
+        # Final fallback
         if base_score is None:
-            base_score = max(dense_score, bm25_score) if (dense_score > 0 or bm25_score > 0) else (fallback_score or 0.0)
+            base_score = fallback_score or 0.0
         base_score = float(base_score or 0.0)
         
         # IMPORTANT: Combine title and text scores with title having higher weight (2:1 ratio)
@@ -461,16 +517,44 @@ class HybridRetriever:
         
         score = float(score or 0.0)
 
+        # Build candidate dict - include rrf_score for debugging
+        # CRITICAL: Try to get scores from doc directly if they're not in the processed fields
+        # This handles cases where scores were set but not properly extracted
+        if dense_score is None:
+            # Try to get from doc directly
+            dense_score_raw = doc.get("dense_score")
+            if dense_score_raw is not None:
+                dense_score_float = float(dense_score_raw)
+                if dense_score_float > -3.4e38:  # Not a sentinel
+                    dense_score = dense_score_float
+            # If still None, check source_scores
+            if dense_score is None and "dense" in source_scores:
+                dense_score = float(source_scores["dense"])
+        
+        if bm25_score is None:
+            # Try to get from doc directly
+            bm25_score_raw = doc.get("bm25_score")
+            if bm25_score_raw is not None:
+                bm25_score_float = float(bm25_score_raw)
+                if bm25_score_float > -3.4e38:  # Not a sentinel
+                    bm25_score = bm25_score_float
+            # If still None, check source_scores
+            if bm25_score is None and "bm25" in source_scores:
+                bm25_score = float(source_scores["bm25"])
+        
+        # CRITICAL: Convert None to 0.0 for JSON serialization, but preserve None semantics
+        # Use 0.0 for "no match" scores, None only for "not found by retriever"
         candidate = {
             "chunk_id": chunk_id,
             "doc_id": str(doc_id),
             "score": score,
-            "dense_score": dense_score,
-            "bm25_score": bm25_score,
+            "dense_score": dense_score if dense_score is not None else 0.0,  # 0.0 if not found by dense retriever
+            "bm25_score": bm25_score if bm25_score is not None else 0.0,  # 0.0 if not found by BM25 retriever
+            "rrf_score": float(rrf_score) if rrf_score is not None else None,  # RRF fusion score for debugging
             "title_score": title_score,
             "text_score": text_score,
             "contents": doc.get("contents") or doc.get("text") or "",
-            "source_scores": {key: float(value) for key, value in source_scores.items()},
+            "source_scores": {key: float(value) for key, value in source_scores.items() if value is not None},
             "sources": doc.get("sources", []),
             "has_table": doc.get("has_table", False),
         }
