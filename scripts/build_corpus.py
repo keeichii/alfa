@@ -16,6 +16,7 @@ sys.path.insert(0, str(project_root))
 
 import yaml
 from src.ingest import build_corpus
+from src.utils import logger
 
 
 def load_config(config_path: str) -> dict:
@@ -48,13 +49,21 @@ def main():
         text_processing = config.get("text_processing", {})
         normalize_for_search = text_processing.get("normalize_for_retrieval", True)
         normalization_mode = text_processing.get("normalization_mode", "smart")
+        logger.info(f"Using normalization_mode='{normalization_mode}' from config")
     else:
         if not args.input or not args.output:
-            parser.error("Either --config or both --input and --output must be provided")
+            parser.error(
+                "Either --config or both --input and --output must be provided.\n"
+                "Recommended: use 'python scripts/build_corpus.py --config configs/base.yaml'"
+            )
         input_csv = args.input
         output_jsonl = args.output
         normalize_for_search = True
-        normalization_mode = "letters_numbers"
+        normalization_mode = "smart"  # Changed default to match config
+        logger.warning(
+            f"Running without config, using default normalization_mode='{normalization_mode}'. "
+            "Recommended: use --config configs/base.yaml for consistency."
+        )
     
     build_corpus(input_csv, output_jsonl, normalize_for_search=normalize_for_search, normalization_mode=normalization_mode)
 

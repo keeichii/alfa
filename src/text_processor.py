@@ -104,7 +104,7 @@ def remove_common_footers(text: str) -> str:
     if not text:
         return text
     
-    # Common footer patterns (banking domain)
+    # Common footer patterns (banking domain) - expanded list
     footer_patterns = [
         # Copyright and legal info
         r"©\s*\d{4}[-\d]*\s*АО\s*«Альфа-Банк».*?$",
@@ -114,9 +114,21 @@ def remove_common_footers(text: str) -> str:
         r"Информация\s*профессионального\s*участника\s*рынка\s*ценных\s*бумаг.*?$",
         r"Ул\.\s*Каланчевская.*?Москва.*?$",
         r"АО\s*«Альфа-Банк»\s*использует\s*файлы\s*«cookie».*?$",
+        r"Политика\s*в\s*отношении\s*обработки\s*персональных\s*данных.*?$",
+        r"Информация\s*о\s*лицах.*?находится\s*Банк.*?$",
+        r"Участник\s*системы\s*обязательного\s*страхования\s*вкладов.*?$",
+        r"Информация\s*о\s*процентных\s*ставках.*?вклада.*?$",
         # Generic patterns
         r"©\s*\d{4}[-\d]*.*?$",  # Generic copyright
         r"Все\s*права\s*защищены.*?$",
+        r"Политика\s*конфиденциальности.*?$",
+        r"Условия\s*использования.*?$",
+        # Navigation and menu items
+        r"^(Главная|О\s*банке|Услуги|Контакты|Карта\s*сайта).*?$",
+        r"^(Вернуться\s*наверх|Наверх|Вверх).*?$",
+        # Contact info patterns
+        r"\+?\d{1,3}[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}.*?$",  # Phone numbers
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}.*?$",  # Email addresses (if standalone)
     ]
     
     lines = text.split("\n")
@@ -244,26 +256,58 @@ def merge_short_paragraphs(text: str, min_length: int = 50) -> str:
     return "\n".join(merged)
 
 
-def validate_document(title: str, text: str) -> tuple:
+def validate_document(title: str, text: str, strict: bool = False) -> tuple:
     """
-    Validate document quality.
+    Validate document quality with soft filtering for banking domain.
+    
+    Args:
+        title: Document title
+        text: Document text
+        strict: If True, use strict filtering. If False, preserve short but meaningful docs.
     
     Returns:
-        (is_valid, error_message)
+        (is_valid, error_message_or_warning)
     """
     if not title and not text:
         return False, "Both title and text are empty"
     
-    if text and len(text.strip()) < 10:
-        return False, f"Text too short: {len(text.strip())} characters"
+    text_stripped = text.strip() if text else ""
+    text_len = len(text_stripped)
     
-    # check for excessive repetition (potential data corruption)
+    # Banking domain keywords that indicate important short documents
+    banking_keywords = [
+        "кредит", "карта", "счет", "счёт", "расчетный", "расчётный", "бик", "реквизиты",
+        "вклад", "депозит", "перевод", "платеж", "платёж", "комиссия", "процент", "ставка",
+        "лимит", "баланс", "выписка", "отделение", "офис", "филиал"
+    ]
+    
+    # Soft check: if text is short but contains banking keywords, keep it
+    if text_len < 10:
+        # Check for banking keywords even in short text
+        text_lower = text_stripped.lower()
+        has_keywords = any(keyword in text_lower for keyword in banking_keywords)
+        if has_keywords and not strict:
+            return True, None  # Keep short but meaningful banking docs
+        return False, f"Text too short: {text_len} characters"
+    
+    # For very short texts (10-50 chars), be more lenient if they have keywords
+    if 10 <= text_len < 50:
+        text_lower = text_stripped.lower()
+        has_keywords = any(keyword in text_lower for keyword in banking_keywords)
+        if has_keywords:
+            return True, None  # Keep short meaningful docs
+    
+    # Check for excessive repetition (potential data corruption)
+    # Made softer: only reject if very repetitive AND long
     if text:
         words = text.split()
-        if len(words) > 0:
+        if len(words) > 100:  # Only check repetition for longer texts
             unique_ratio = len(set(words)) / len(words)
-            if unique_ratio < 0.1 and len(words) > 100:
+            if unique_ratio < 0.05:  # Very strict threshold (was 0.1)
                 return False, f"Excessive repetition detected: {unique_ratio:.2f} unique ratio"
+            elif unique_ratio < 0.15 and strict:
+                # Warning but don't reject unless strict mode
+                return True, f"Low uniqueness: {unique_ratio:.2f} (kept due to soft mode)"
     
     return True, None
 

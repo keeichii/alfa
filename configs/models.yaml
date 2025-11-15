@@ -37,7 +37,7 @@ tokenizer:
   # - path to huggingface tokenizer
 
 faiss:
-  index_type: "Flat"  # "Flat", "IVFFlat", "IVFPQ"
+  index_type: "IVFFlat"  # "Flat", "IVFFlat", "IVFPQ"
   # for large datasets, consider IVFFlat or IVFPQ
   nprobe: 10  # for IVF indices
   use_gpu: true           # FAISS index is cloned to GPU

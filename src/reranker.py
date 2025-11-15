@@ -157,7 +157,13 @@ class Reranker:
         )
         doc_id = doc.get("doc_id")
         if doc_id is None:
-            doc_id = chunk_id.split("_")[0] if "_" in chunk_id else chunk_id
+            # Extract doc_id from chunk_id format: {doc_id}_{seg_idx}_{chunk_idx} or {doc_id}_{idx}
+            if "_" in chunk_id:
+                doc_id = chunk_id.split("_")[0]
+            else:
+                doc_id = chunk_id
+        # Ensure doc_id is a string (FlashRAG normalizes to string)
+        doc_id = str(doc_id) if doc_id is not None else "0"
 
         candidate = dict(doc)
         candidate["chunk_id"] = chunk_id

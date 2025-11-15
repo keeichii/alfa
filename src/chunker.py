@@ -1,5 +1,6 @@
 """Chunk documents into smaller pieces with proper tokenization and smart paragraph merging."""
 import logging
+import re
 from typing import Dict, List, Optional
 
 try:
@@ -144,6 +145,20 @@ class DocumentChunker:
             # additional cleaning of chunk
             chunk_text = clean_text(chunk_text, preserve_structure=True)
             if not chunk_text:
+                continue
+            
+            # Validate chunk quality (skip very short or noise-only chunks)
+            # Remove punctuation/whitespace and check meaningful content
+            meaningful_chars = re.sub(r'[^\w\s]', '', chunk_text)
+            meaningful_chars = re.sub(r'\s+', '', meaningful_chars)
+            if len(meaningful_chars) < 10:  # At least 10 meaningful characters
+                logger.debug(f"Skipping chunk {idx} for doc {doc_id}: too short after cleaning")
+                continue
+            
+            # Check for noise patterns (only punctuation, numbers, etc.)
+            words = [w for w in chunk_text.split() if len(re.sub(r'[^\w]', '', w)) >= 2]
+            if len(words) < 2:  # At least 2 meaningful words
+                logger.debug(f"Skipping chunk {idx} for doc {doc_id}: too few meaningful words")
                 continue
             
             # build chunk contents (for FlashRAG compatibility)

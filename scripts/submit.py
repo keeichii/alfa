@@ -31,6 +31,7 @@ from src.retriever import HybridRetriever
 from src.reranker import Reranker
 from src.reranker_ensemble import RerankerEnsemble
 from src.utils import logger, get_timestamp, resolve_device
+from src.query_validator import validate_and_clean_questions
 def validate_against_sample(results: Dict[int, List[int]], sample_path: Path, k_final: int) -> None:
     """Ensure submission matches the sample format (q_ids set and list length)."""
     if not sample_path.exists():
@@ -117,6 +118,17 @@ def main():
     logger.info(f"Reading questions from {questions_path}")
     questions = read_questions(questions_path)
     logger.info(f"Loaded {len(questions)} questions")
+    
+    # validate and clean questions
+    logger.info("Validating and cleaning questions...")
+    questions, validation_stats = validate_and_clean_questions(questions)
+    logger.info(
+        f"Questions validation: total={validation_stats['total']}, "
+        f"valid={validation_stats['valid']}, cleaned={validation_stats['cleaned']}, "
+        f"removed={validation_stats['removed']}"
+    )
+    if validation_stats['removed'] > 0:
+        logger.warning(f"Removed {validation_stats['removed']} invalid questions")
     
     # initialize retriever
     logger.info("Initializing hybrid retriever (FAISS + FlashRAG bm25s)...")
@@ -315,7 +327,18 @@ def main():
 
             reranked_batch = _run_reranker_with_retry()
         else:
+            # No reranker: use retriever results directly
             reranked_batch = [candidates[:k_final] if candidates else [] for candidates in batch_candidates]
+        
+        # Safety check: if reranker returned empty results, fallback to retriever
+        for local_idx, reranked in enumerate(reranked_batch):
+            if not reranked and local_idx < len(batch_candidates):
+                reranked_batch[local_idx] = batch_candidates[local_idx][:k_final] if batch_candidates[local_idx] else []
+                if batch_candidates[local_idx]:
+                    logger.debug(
+                        f"Question {q_ids[local_idx] if local_idx < len(q_ids) else 'N/A'}: "
+                        "Reranker returned empty, using retriever results"
+                    )
         
         # Ensure we process ALL q_ids in the batch, even if there were errors
         for local_idx, (q_id, _) in enumerate(batch):
@@ -363,16 +386,33 @@ def main():
                         key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
                         reverse=True
                     )[:k_final]
-                    web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+                    # Safely convert doc_id to int, filtering out invalid values
+                    web_ids = []
+                    for c in deduped_candidates:
+                        try:
+                            doc_id = int(c.get("doc_id", 0))
+                            if doc_id > 0:
+                                web_ids.append(doc_id)
+                        except (ValueError, TypeError):
+                            continue
                 else:
                     web_ids = []
                 
                 # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
-                while len(web_ids) < k_final:
+                if len(web_ids) < k_final:
                     if web_ids:
-                        web_ids.append(web_ids[-1])  # Duplicate last
+                        # Fill with duplicates of best web_id
+                        while len(web_ids) < k_final:
+                            web_ids.append(web_ids[0])  # Use first (best) instead of last
+                        logger.warning(
+                            f"Question {q_id}: Only {len(set(web_ids))} unique web_ids found, "
+                            f"filled to {k_final} with duplicates"
+                        )
                     else:
-                        web_ids.append(1)  # Fallback
+                        # Ultimate fallback: use web_id=1
+                        web_ids = [1] * k_final
+                        logger.warning(f"Question {q_id}: No valid web_ids found, using fallback [1]*{k_final}")
+                
                 web_ids = web_ids[:k_final]
                 batch_results[q_id] = web_ids
             except Exception as e:

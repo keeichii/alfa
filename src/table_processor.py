@@ -26,7 +26,7 @@ def detect_table(text: str) -> bool:
 
 def extract_table_structure(text: str) -> Tuple[str, bool]:
     """
-    Extract and normalize table structure.
+    Extract and normalize table structure, converting to readable text format.
     
     Returns:
         (normalized_text, is_table) - normalized text with preserved structure
@@ -37,10 +37,15 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
     lines = text.split('\n')
     normalized_lines = []
     is_table = False
+    table_rows = []
     
     for line in lines:
         line = line.strip()
         if not line:
+            # If we were collecting a table, flush it
+            if table_rows:
+                normalized_lines.extend(_format_table_as_text(table_rows))
+                table_rows = []
             normalized_lines.append("")
             continue
         
@@ -51,21 +56,82 @@ def extract_table_structure(text: str) -> Tuple[str, bool]:
             if re.match(r'^[\|\s\-:]+$', line):
                 # Skip separator rows like |---|---|
                 continue
-            # Normalize table row
+            # Extract cells
             cells = [cell.strip() for cell in line.split('|') if cell.strip()]
-            normalized_line = " | ".join(cells)
-            normalized_lines.append(normalized_line)
+            if len(cells) >= 2:  # At least 2 columns
+                table_rows.append(cells)
+            else:
+                # Not a table row, flush and add as regular text
+                if table_rows:
+                    normalized_lines.extend(_format_table_as_text(table_rows))
+                    table_rows = []
+                normalized_lines.append(line)
         # Tab-separated or space-aligned
         elif '\t' in line or re.search(r'  +', line):
             is_table = True
-            # Replace multiple spaces/tabs with single space, preserve structure
-            normalized_line = re.sub(r'[\t ]+', ' ', line).strip()
-            normalized_lines.append(normalized_line)
+            # Split by tabs or multiple spaces
+            if '\t' in line:
+                cells = [c.strip() for c in line.split('\t') if c.strip()]
+            else:
+                cells = [c.strip() for c in re.split(r'  +', line) if c.strip()]
+            if len(cells) >= 2:  # At least 2 columns
+                table_rows.append(cells)
+            else:
+                # Not a table row, flush and add as regular text
+                if table_rows:
+                    normalized_lines.extend(_format_table_as_text(table_rows))
+                    table_rows = []
+                normalized_lines.append(re.sub(r'[\t ]+', ' ', line).strip())
         else:
+            # Regular text line - flush table if collecting
+            if table_rows:
+                normalized_lines.extend(_format_table_as_text(table_rows))
+                table_rows = []
             normalized_lines.append(line)
+    
+    # Flush any remaining table
+    if table_rows:
+        normalized_lines.extend(_format_table_as_text(table_rows))
     
     normalized_text = '\n'.join(normalized_lines)
     return normalized_text, is_table
+
+
+def _format_table_as_text(rows: List[List[str]]) -> List[str]:
+    """
+    Format table rows as readable text.
+    
+    Example:
+        [["Валюта", "Покупка", "Продажа"], ["USD", "77", "80.4"]]
+        -> ["Валюта: Покупка 77, Продажа 80.4", "USD: Покупка 77, Продажа 80.4"]
+    """
+    if not rows or len(rows) < 2:
+        return []
+    
+    formatted = []
+    headers = rows[0] if len(rows[0]) > 1 else None
+    
+    # If we have headers, format as "Header: Value1, Value2"
+    if headers and len(headers) >= 2:
+        for row in rows[1:]:
+            if len(row) >= 2:
+                # First column is usually the key
+                key = row[0]
+                values = []
+                for i, header in enumerate(headers[1:], 1):
+                    if i < len(row):
+                        values.append(f"{header} {row[i]}")
+                if values:
+                    formatted.append(f"{key}: {', '.join(values)}")
+    else:
+        # No headers, format as "Column1: Column2, Column3"
+        for row in rows:
+            if len(row) >= 2:
+                key = row[0]
+                values = ', '.join(row[1:])
+                formatted.append(f"{key}: {values}")
+    
+    return formatted if formatted else []
 
 
 def preserve_table_in_chunk(table_text: str, chunk_text: str) -> str:

@@ -29,6 +29,7 @@ import yaml
 from src.batch_processor import optimize_batch_size
 from src.evaluator import RetrievalEvaluator
 from src.failure_logger import FailureLogger
+from src.query_validator import validate_and_clean_questions
 from src.reranker import Reranker
 from src.reranker_ensemble import RerankerEnsemble
 from src.retriever import HybridRetriever
@@ -65,6 +66,12 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate retrieval pipeline")
     parser.add_argument("--config", default="configs/base.yaml", help="Path to config file")
     parser.add_argument("--ground_truth", help="Path to ground truth JSON file (optional)")
+    parser.add_argument(
+        "--mode",
+        choices=["retriever", "retriever+reranker", "auto"],
+        default="auto",
+        help="Evaluation mode: 'retriever' (no reranker), 'retriever+reranker' (with reranker), 'auto' (use config)"
+    )
     args = parser.parse_args()
     
     # load configs
@@ -82,7 +89,17 @@ def main():
     k_retrieve = retrieval_config["k_retrieve"]
     k_final = retrieval_config["k_final"]
     k_rerank = retrieval_config.get("k_rerank", min(k_retrieve, 20))
-    use_reranker = retrieval_config.get("use_reranker", True)
+    
+    # Determine reranker usage based on mode
+    if args.mode == "retriever":
+        use_reranker = False
+        logger.info("Mode: retriever only (reranker disabled)")
+    elif args.mode == "retriever+reranker":
+        use_reranker = True
+        logger.info("Mode: retriever + reranker")
+    else:  # auto
+        use_reranker = retrieval_config.get("use_reranker", True)
+        logger.info(f"Mode: auto (use_reranker={use_reranker} from config)")
     
     reranker_config = models_config["reranker"]
     faiss_config = models_config.get("faiss", {})
@@ -92,6 +109,17 @@ def main():
     logger.info(f"Reading questions from {questions_path}")
     questions = read_questions(questions_path)
     logger.info(f"Loaded {len(questions)} questions")
+    
+    # validate and clean questions
+    logger.info("Validating and cleaning questions...")
+    questions, validation_stats = validate_and_clean_questions(questions)
+    logger.info(
+        f"Questions validation: total={validation_stats['total']}, "
+        f"valid={validation_stats['valid']}, cleaned={validation_stats['cleaned']}, "
+        f"removed={validation_stats['removed']}"
+    )
+    if validation_stats['removed'] > 0:
+        logger.warning(f"Removed {validation_stats['removed']} invalid questions")
     
     # initialize retriever
     logger.info("Initializing hybrid retriever (FAISS + FlashRAG bm25s)...")
@@ -185,8 +213,35 @@ def main():
         ground_truth_path = Path(ground_truth_path)
         if ground_truth_path.exists():
             evaluator.load_ground_truth(str(ground_truth_path))
+            logger.info(f"Loaded ground truth for {len(evaluator.ground_truth)} queries")
         else:
             logger.warning(f"Ground truth file not found: {ground_truth_path}")
+    
+    # Check consistency between questions and ground truth
+    question_q_ids = set(q_id for q_id, _ in questions)
+    if evaluator.ground_truth:
+        gt_q_ids = set(evaluator.ground_truth.keys())
+        missing_in_gt = question_q_ids - gt_q_ids
+        missing_in_questions = gt_q_ids - question_q_ids
+        
+        if missing_in_gt:
+            logger.warning(
+                f"Found {len(missing_in_gt)} questions without ground truth "
+                f"(examples: {sorted(list(missing_in_gt))[:5]})"
+            )
+        if missing_in_questions:
+            logger.warning(
+                f"Found {len(missing_in_questions)} ground truth entries without questions "
+                f"(examples: {sorted(list(missing_in_questions))[:5]})"
+            )
+        
+        common = question_q_ids & gt_q_ids
+        logger.info(
+            f"Ground truth coverage: {len(common)}/{len(question_q_ids)} questions "
+            f"({len(common)*100/len(question_q_ids):.1f}%)"
+        )
+    else:
+        logger.warning("No ground truth loaded - evaluation metrics will be limited")
     
     # initialize failure logger
     failure_logger = FailureLogger(evaluator.ground_truth)
@@ -202,6 +257,7 @@ def main():
     last_log_time = start_time
     processed = 0
     first_question_logged = False
+    diagnostic_recall_computed = False  # Track if diagnostic recall@50 was computed
     
     base_batch_size = max(1, retrieval_config.get("batch_size", 64))
     min_retrieval_batch = max(
@@ -239,6 +295,7 @@ def main():
     
     def process_batch(batch_data: Tuple[int, List[Tuple[int, str]]]) -> Tuple[Dict[int, List[int]], List[Dict], int]:
         """Process a single batch and return results, logs, and count."""
+        nonlocal diagnostic_recall_computed
         batch_start, batch = batch_data
         q_ids = [q for q, _ in batch]
         query_texts = [query for _, query in batch]
@@ -261,18 +318,34 @@ def main():
         
         original_candidates = [copy.deepcopy(cands) for cands in batch_candidates]
         
-        # Diagnostic: compute recall@50 before reranking if ground truth available
-        if evaluator.ground_truth and batch_start == 0:
+        # Diagnostic: compute recall@50 before reranking (one-time, first batch only)
+        # This helps understand retriever quality before reranking
+        nonlocal diagnostic_recall_computed
+        if not diagnostic_recall_computed and evaluator.ground_truth and batch_start == 0:
             recall_at_50_before_rerank = 0.0
+            queries_with_gt = 0
             for local_idx, (q_id, _) in enumerate(batch):
                 if q_id in evaluator.ground_truth:
-                    retrieved_web_ids = [int(c.get("doc_id", 0)) for c in batch_candidates[local_idx][:50]]
+                    queries_with_gt += 1
+                    retrieved_web_ids = []
+                    for c in batch_candidates[local_idx][:50]:
+                        try:
+                            doc_id = int(c.get("doc_id", 0))
+                            if doc_id > 0:
+                                retrieved_web_ids.append(doc_id)
+                        except (ValueError, TypeError):
+                            continue
                     recall_at_50_before_rerank += evaluator.recall_at_k(q_id, retrieved_web_ids, k=50)
-            if len(batch) > 0:
-                recall_at_50_before_rerank /= len(batch)
-                logger.info(f"Diagnostic: Recall@50 before rerank (first batch): {recall_at_50_before_rerank:.4f}")
+            
+            if queries_with_gt > 0:
+                recall_at_50_before_rerank /= queries_with_gt
+                logger.info(
+                    f"Diagnostic (first batch): Recall@50 before rerank = {recall_at_50_before_rerank:.4f} "
+                    f"(computed over {queries_with_gt} queries with ground truth)"
+                )
             else:
-                logger.warning("First batch is empty, skipping diagnostic recall@50")
+                logger.warning("No queries with ground truth in first batch, skipping recall@50 diagnostic")
+            diagnostic_recall_computed = True
         
         reranked_batch = [cands[:k_final] for cands in batch_candidates]
         
@@ -332,7 +405,7 @@ def main():
                 "candidates": [
                     {
                         "chunk_id": c["chunk_id"],
-                        "doc_id": int(c["doc_id"]),
+                        "doc_id": int(c.get("doc_id", 0)) if c.get("doc_id") else 0,
                         "score": c["score"],
                         "dense_score": c.get("dense_score", 0.0),
                         "bm25_score": c.get("bm25_score", 0.0)
@@ -352,7 +425,7 @@ def main():
                     "candidates": [
                         {
                             "chunk_id": c["chunk_id"],
-                            "doc_id": int(c["doc_id"]),
+                            "doc_id": int(c.get("doc_id", 0)) if c.get("doc_id") else 0,
                             "score": c.get("rerank_score", c.get("score", 0.0))
                         }
                         for c in reranked_candidates[:k_final]
@@ -400,7 +473,15 @@ def main():
                 reverse=True
             )[:k_final]
             
-            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
+            # Safely convert doc_id to int, filtering out invalid values
+            web_ids = []
+            for c in deduped_candidates:
+                try:
+                    doc_id = int(c.get("doc_id", 0))
+                    if doc_id > 0:
+                        web_ids.append(doc_id)
+                except (ValueError, TypeError):
+                    continue
             # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
             while len(web_ids) < k_final:
                 if web_ids:

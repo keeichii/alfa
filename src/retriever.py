@@ -190,6 +190,7 @@ class HybridRetriever:
 
     def _prepare_queries(self, queries: List[str]) -> List[str]:
         from src.text_processor import normalize_for_retrieval
+        from src.query_validator import clean_query, is_valid_query
         
         prepared = []
         for query in queries:
@@ -200,12 +201,22 @@ class HybridRetriever:
             
             original_query = query.strip()
             
+            # Clean query first (remove noise, excessive punctuation)
+            cleaned_query = clean_query(original_query)
+            if cleaned_query is None or not is_valid_query(cleaned_query):
+                # Invalid query after cleaning - use placeholder
+                logger.debug(f"Skipping invalid query: {original_query[:50]}...")
+                prepared.append(" ")
+                continue
+            
+            query = cleaned_query
+            
             # Apply numeric enhancement if enabled
             if self.enhance_numerics:
                 try:
-                    query = enhance_query_for_numerics(original_query)
+                    query = enhance_query_for_numerics(query)
                 except Exception:
-                    query = original_query  # Fallback to original on error
+                    pass  # Keep cleaned query if enhancement fails
             
             # Normalize query to match corpus normalization
             try:
@@ -215,9 +226,9 @@ class HybridRetriever:
             
             # Ensure normalized query is not empty and has at least one character
             if not normalized or not normalized.strip() or len(normalized.strip()) == 0:
-                # Fallback to original query if normalization removed everything
-                if original_query and original_query.strip():
-                    prepared.append(original_query.strip())
+                # Fallback to cleaned query if normalization removed everything
+                if cleaned_query and cleaned_query.strip():
+                    prepared.append(cleaned_query.strip())
                 else:
                     prepared.append(" ")  # Ultimate fallback
             else:
@@ -318,7 +329,13 @@ class HybridRetriever:
         )
         doc_id = doc.get("doc_id")
         if doc_id is None:
-            doc_id = chunk_id.split("_")[0] if "_" in chunk_id else chunk_id
+            # Extract doc_id from chunk_id format: {doc_id}_{seg_idx}_{chunk_idx} or {doc_id}_{idx}
+            if "_" in chunk_id:
+                doc_id = chunk_id.split("_")[0]
+            else:
+                doc_id = chunk_id
+        # Ensure doc_id is a string (FlashRAG normalizes to string)
+        doc_id = str(doc_id) if doc_id is not None else "0"
 
         source_scores = doc.get("source_scores") or {}
         if not isinstance(source_scores, dict):

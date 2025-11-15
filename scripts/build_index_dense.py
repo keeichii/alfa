@@ -65,27 +65,37 @@ def main():
     # Determine pooling method before building index (to save in metadata)
     # This matches the auto-detection logic in Index_Builder
     pooling_method = None
+    
+    # Try to detect pooling method from model config
+    try:
+        import json
+        import os
+        # Try SentenceTransformer model path structure
+        pooling_config_path = os.path.join(model_path, "1_Pooling/config.json")
+        if os.path.exists(pooling_config_path):
+            with open(pooling_config_path, "r", encoding="utf-8") as f:
+                pooling_config = json.load(f)
+            for k, v in pooling_config.items():
+                if k.startswith("pooling_mode") and v == True:
+                    pooling_method = k.split("pooling_mode_")[-1]
+                    if pooling_method == "mean_tokens":
+                        pooling_method = "mean"
+                    elif pooling_method == "cls_token":
+                        pooling_method = "cls"
+                    else:
+                        pooling_method = "mean"
+                    break
+    except Exception:
+        pass
+    
+    # Default pooling for E5 models is mean
     if pooling_method is None:
-        try:
-            import json
-            import os
-            pooling_config_path = os.path.join(model_path, "1_Pooling/config.json")
-            if os.path.exists(pooling_config_path):
-                pooling_config = json.load(open(pooling_config_path))
-                for k, v in pooling_config.items():
-                    if k.startswith("pooling_mode") and v == True:
-                        pooling_method = k.split("pooling_mode_")[-1]
-                        if pooling_method == "mean_tokens":
-                            pooling_method = "mean"
-                        elif pooling_method == "cls_token":
-                            pooling_method = "cls"
-                        else:
-                            pooling_method = "mean"
-                        break
-        except:
-            pass
-    if pooling_method is None:
-        pooling_method = "mean"  # default
+        if "e5" in model_path.lower():
+            pooling_method = "mean"
+        else:
+            pooling_method = "mean"  # default for most models
+    
+    print(f"  Pooling method: {pooling_method}")
     
     # Determine instruction (auto-detect for E5/BGE)
     instruction = None  # Will be auto-detected by FlashRAG
