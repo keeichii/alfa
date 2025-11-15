@@ -28,19 +28,26 @@ alfa/
 ├── scripts/              # CLI entry points
 │   ├── quick_test.py     # quick pipeline validation (~15 min)
 │   ├── build_corpus.py   # corpus building
+│   ├── check_corpus_stats.py  # corpus statistics analysis
 │   ├── chunk_corpus.py   # semantic chunking
 │   ├── build_index_dense.py  # FAISS index
 │   ├── build_index_bm25.py   # BM25 index
 │   ├── eval.py           # evaluation with metrics
+│   ├── check_ground_truth.py # ground truth consistency check
 │   └── submit.py         # submission generation
 ├── src/                  # project modules
 │   ├── retriever.py      # FlashRAG hybrid retriever wrapper
 │   ├── reranker.py       # FlashRAG CrossReranker wrapper
 │   ├── reranker_ensemble.py  # ensemble reranker support
 │   ├── chunker.py        # semantic + structural chunking
-│   ├── table_processor.py# numeric-aware query enrichment
-│   ├── text_processor.py # text normalization
+│   ├── semantic_chunker.py  # semantic chunking implementation
+│   ├── table_processor.py  # numeric-aware query enrichment & table processing
+│   ├── text_processor.py # text normalization & document validation
+│   ├── query_validator.py  # query validation & cleaning
+│   ├── ingest.py         # corpus building & document processing
 │   ├── evaluator.py      # metrics & failure analysis
+│   ├── batch_processor.py  # batch size optimization
+│   ├── failure_logger.py  # failure analysis logging
 │   └── utils.py          # logging, device guards, helpers
 ├── FlashRAG/             # vendored FlashRAG (editable)
 ├── requirements.txt
@@ -106,21 +113,42 @@ This validates:
 - Reranker initialization
 - Ensemble reranker (if enabled)
 
-### Full Pipeline
+### Full Pipeline (Step-by-Step)
 
 ```bash
-# Step 1: Build corpus and chunks
+# Step 1: Build corpus from CSV
 make build_corpus
+
+# Step 2 (optional): Check corpus statistics
+make check_corpus
+
+# Step 3: Chunk corpus into smaller pieces
 make chunk_corpus
 
-# Step 2: Build indexes (FAISS + BM25)
+# Step 4-5: Build indexes (FAISS + BM25)
 make build_index
 
-# Step 3: Evaluate (with ground truth if available)
-make eval
+# Step 6: Evaluate retriever only (no reranker)
+make eval_retriever
 
-# Step 4: Generate submission
+# Step 7: Evaluate full pipeline (retriever + reranker)
+make eval_full  # or: make eval
+
+# Step 8: Generate submission
 make submit
+```
+
+### Evaluation Modes
+
+```bash
+# Evaluate retriever only (faster, for debugging)
+python scripts/eval.py --config configs/base.yaml --mode retriever
+
+# Evaluate full pipeline (retriever + reranker)
+python scripts/eval.py --config configs/base.yaml --mode retriever+reranker
+
+# Use config setting (default)
+python scripts/eval.py --config configs/base.yaml --mode auto
 ```
 
 All Make targets execute in GPU mode and will abort immediately if CUDA kernels are missing.
@@ -218,8 +246,10 @@ faiss:
 
 ### Evaluation & Debugging
 - **Comprehensive metrics** — Hit@5, Recall@K, MRR, NDCG@K
+- **Evaluation modes** — retriever-only or full pipeline (retriever + reranker)
 - **Failure analysis** — detailed logs for missed queries with candidate context
 - **Candidate logging** — pre/post rerank candidate snapshots for analysis
+- **Diagnostic tools** — corpus statistics, ground truth consistency checks
 - **Quick test** — fast validation without full rebuild
 
 ---
@@ -228,12 +258,14 @@ faiss:
 
 | Stage | Description | Key scripts |
 |-------|-------------|-------------|
-| **Ingest** | Load CSV, clean text, remove footers, normalize | `scripts/build_corpus.py` |
+| **Ingest** | Load CSV, clean text, remove footers, normalize, validate | `scripts/build_corpus.py` |
+| **Check** | Analyze corpus statistics and retention rate | `scripts/check_corpus_stats.py` |
 | **Chunk** | Semantic chunking with table preservation | `scripts/chunk_corpus.py` |
 | **Index build** | Dense FAISS index + BM25 sparse index | `scripts/build_index_dense.py`, `scripts/build_index_bm25.py` |
 | **Hybrid retrieval** | FAISS + BM25 with RRF fusion | `src/retriever.py` |
 | **Rerank** | Cross-encoder reranker (optional ensemble) | `src/reranker.py`, `src/reranker_ensemble.py` |
 | **Evaluate** | Metrics, failure logs, candidate analysis | `scripts/eval.py` |
+| **Check GT** | Verify ground truth consistency | `scripts/check_ground_truth.py` |
 | **Submit** | Generate submission CSV with validation | `scripts/submit.py` |
 
 ---
@@ -244,6 +276,7 @@ faiss:
 - `outputs/reports/report_*.json` — metrics snapshot (Hit@5, Recall@K, MRR, NDCG@K, timings)
 - `outputs/logs/candidates_*.jsonl` — candidates pre/post rerank for analysis
 - `outputs/logs/failures_*.json` — structured diagnostics for missed queries
+- `data/processed/corpus_rejected.json` — log of rejected documents during corpus building
 
 ---
 
@@ -261,6 +294,12 @@ Provide ground truth via:
 - Config file: Set `evaluation.ground_truth_path` in `configs/base.yaml`
 
 Format: JSON file with `{"q_id": [web_id, ...]}` mapping
+
+**Check consistency:**
+```bash
+make check_ground_truth GT_PATH=path/to/ground_truth.json
+```
+This verifies that question IDs match between `questions_clean.csv` and ground truth.
 
 ---
 

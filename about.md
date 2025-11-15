@@ -38,10 +38,12 @@ questions.csv ──► query normalization ──► query expansion (banking s
 
 ### Chunking & Enrichment
 
-- **Semantic chunking**: `src/chunker.py` / `src/semantic_chunker.py` preserve tables and headings intact.
-- **Text normalization**: `src/text_processor.py` applies configurable normalization (smart mode preserves important symbols like `|`, `%`, `.`, `,`, `-`).
+- **Semantic chunking**: `src/chunker.py` / `src/semantic_chunker.py` preserve tables and headings intact. Can be switched to token-based chunking via `chunking.use_semantic_chunking` config.
+- **Text normalization**: `src/text_processor.py` applies configurable normalization (smart mode preserves important symbols like `|`, `%`, `.`, `,`, `-`). Normalization mode is consistent across corpus indexing and query processing.
+- **Document validation**: Soft filtering preserves short but meaningful banking documents (e.g., containing keywords like "счет", "карта", "кредит").
 - **Footer removal**: Automatic removal of repetitive legal/copyright footers from documents.
 - **Query expansion**: `src/table_processor.py` enriches queries with banking domain synonyms and numeric patterns.
+- **Query validation**: `src/query_validator.py` filters out invalid queries (punctuation-only, empty, etc.) before processing.
 - **Shared corpus**: The same `chunks.jsonl` is shared by both FAISS and bm25s indexes to avoid mismatched doc IDs.
 
 ---
@@ -94,7 +96,22 @@ score = sum(1 / (rrf_k + rank)) for each retriever
 
 ---
 
-## 4. Accuracy Optimizations
+## 4. Data Quality Improvements
+
+### Document Filtering
+- **Soft validation**: Short documents (10-50 chars) with banking keywords are preserved instead of being rejected.
+- **Repetition detection**: Only very repetitive long documents (>100 words, unique_ratio < 0.05) are rejected.
+- **Detailed logging**: Rejected documents are logged to `corpus_rejected.json` with reasons and statistics.
+
+### Query Validation
+- **Noise filtering**: Invalid queries (punctuation-only, empty, repetitive) are filtered before processing.
+- **Query cleaning**: Excessive punctuation is removed while preserving meaningful content.
+
+### Corpus Statistics
+- **Retention tracking**: `scripts/check_corpus_stats.py` analyzes retention rate and text length distribution.
+- **Consistency checks**: `scripts/check_ground_truth.py` verifies alignment between questions and ground truth.
+
+## 5. Accuracy Optimizations
 
 ### Model Upgrades
 - **Embeddings**: Upgraded from `multilingual-e5-base` to `multilingual-e5-large` for better semantic understanding.
@@ -129,7 +146,7 @@ score = sum(1 / (rrf_k + rank)) for each retriever
 
 ---
 
-## 5. Multi-threaded Batched Execution & Logging
+## 6. Multi-threaded Batched Execution & Logging
 
 - **Parallel batch processing**: `ThreadPoolExecutor` with configurable `num_workers` (default: 4) processes multiple batches concurrently.
 - **Optimized batch sizing**: `src/batch_processor.optimize_batch_size()` adjusts batch sizes based on dataset size and hardware capabilities.
@@ -140,15 +157,18 @@ score = sum(1 / (rrf_k + rank)) for each retriever
 - Retrieval and reranking execute in configurable batches (`retrieval.batch_size`, `models.embeddings.batch_size`, `models.reranker.batch_size`).
 - `scripts/eval.py` records:
   - Batch timings (retrieval + rerank) with ETA estimation.
-  - Diagnostic Recall@50 before reranking for the first batch.
+  - Diagnostic Recall@50 before reranking for the first batch (computed once, first batch only).
   - Candidate snapshots before and after rerank to `outputs/logs/candidates_*.jsonl`.
   - Failure summaries (missing gold in top-k) with full candidate context.
+  - Evaluation modes: `--mode retriever` (retriever only) or `--mode retriever+reranker` (full pipeline).
+- `scripts/check_corpus_stats.py` analyzes corpus retention rate and text length distribution.
+- `scripts/check_ground_truth.py` verifies consistency between questions and ground truth.
 - `scripts/benchmark.py --n 200` prints throughput per stage and extrapolated run time.
 - `scripts/quick_test.py` provides fast validation (~15 minutes) without full rebuild.
 
 ---
 
-## 6. Russian Language Support
+## 7. Russian Language Support
 
 ### BM25 Tokenization
 - **Language detection**: Automatic detection of Russian text using `langid`.
@@ -161,7 +181,7 @@ score = sum(1 / (rrf_k + rank)) for each retriever
 
 ---
 
-## 7. Submission Guarantees
+## 8. Submission Guarantees
 
 `scripts/submit.py` enforces:
 
@@ -173,7 +193,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 8. Configuration Cheatsheet
+## 9. Configuration Cheatsheet
 
 ### Retrieval
 - `retrieval.fusion_method`: `"rrf"` (default, more robust) or `"weighted"`.
@@ -196,7 +216,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 9. Performance Recommendations
+## 10. Performance Recommendations
 
 ### Accuracy vs Speed Trade-offs
 
@@ -239,7 +259,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 10. Troubleshooting Checklist
+## 11. Troubleshooting Checklist
 
 - **CUDA error: no kernel image** → Install a torch build matching GPU compute capability (e.g. `pip install torch==2.2.0+cu118 --index-url https://download.pytorch.org/whl/cu118` for compute 6.1).
 - **FAISS GPU API missing** → Install `faiss-gpu` with proper CUDA support: `conda install -c conda-forge faiss-gpu=1.7.4 cudatoolkit=11.8`.
@@ -252,7 +272,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 11. Extensibility Ideas
+## 12. Extensibility Ideas
 
 - Add FlashRAG refiner/compressor modules for selective context.
 - Support alternative ANN layouts (IVF, HNSW) by swapping dense config.
@@ -264,7 +284,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 12. Git & Repo Hygiene
+## 13. Git & Repo Hygiene
 
 - Index artefacts, logs, and outputs are ignored via `.gitignore`.
 - Vendored FlashRAG lives under `FlashRAG/`; reinstall with `pip install -e FlashRAG` after pulling updates involving patched modules.
@@ -273,7 +293,7 @@ The CSV format is therefore stable and leaderboard-ready.
 
 ---
 
-## 13. Key Improvements Applied
+## 14. Key Improvements Applied
 
 This pipeline includes numerous optimizations for accuracy:
 
@@ -282,9 +302,12 @@ This pipeline includes numerous optimizations for accuracy:
 3. **Chunking**: size=280, overlap=110, semantic chunking enabled
 4. **Text processing**: smart normalization, footer removal, title normalization
 5. **Query enhancement**: banking synonyms, query rewriting, numeric patterns
-6. **Advanced techniques**: ensemble reranking, second-pass reranking, filtering options
-7. **Russian support**: optimized tokenization with custom stopwords
-8. **GPU optimization**: strict CUDA validation, FP16 support, multi-threaded batching
+6. **Data quality**: soft document validation, query validation, corpus statistics
+7. **Advanced techniques**: ensemble reranking, second-pass reranking, filtering options
+8. **Russian support**: optimized tokenization with custom stopwords
+9. **GPU optimization**: strict CUDA validation, FP16 support, multi-threaded batching
+10. **Evaluation modes**: retriever-only and full pipeline evaluation modes
+11. **Diagnostic tools**: corpus statistics, ground truth consistency checks
 
 ---
 
