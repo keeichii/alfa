@@ -260,10 +260,14 @@ def main():
             batch_candidates = [[] for _ in batch]
         
         if reranker:
-            rerank_inputs = [
-                [dict(candidate) for candidate in candidates[:k_rerank]]
-                for candidates in batch_candidates
-            ]
+            # Ensure rerank_inputs has at least one candidate per query to avoid division by zero
+            rerank_inputs = []
+            for candidates in batch_candidates:
+                if candidates:
+                    rerank_inputs.append([dict(candidate) for candidate in candidates[:k_rerank]])
+                else:
+                    # Empty candidates - use dummy candidate to avoid errors
+                    rerank_inputs.append([{"chunk_id": "dummy", "doc_id": 1, "score": 0.0, "text": " "}])
 
             def _run_reranker_with_retry() -> List[List[Dict]]:
                 attempts = 0
@@ -297,65 +301,84 @@ def main():
                             q_ids[-1] if q_ids else "N/A",
                             exc,
                         )
+                        # Return original inputs as fallback
+                        return rerank_inputs
+                    except Exception as exc:
+                        # Catch any other exceptions (including division by zero)
+                        logger.error(
+                            "Batch reranking failed for questions %s-%s: %s",
+                            q_ids[0] if q_ids else "N/A",
+                            q_ids[-1] if q_ids else "N/A",
+                            exc,
+                        )
                         return rerank_inputs
 
             reranked_batch = _run_reranker_with_retry()
         else:
-            reranked_batch = [candidates[:k_final] for candidates in batch_candidates]
+            reranked_batch = [candidates[:k_final] if candidates else [] for candidates in batch_candidates]
         
+        # Ensure we process ALL q_ids in the batch, even if there were errors
         for local_idx, (q_id, _) in enumerate(batch):
-            candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
-            final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
-            if not final_candidates:
-                final_candidates = candidates[:k_final]
-            
-            # Deduplicate by web_id: keep best chunk per document
-            web_id_to_best_chunk = {}
-            for candidate in final_candidates:
-                try:
-                    doc_id = int(candidate.get("doc_id", 0))
-                    if doc_id <= 0:
-                        continue
-                    # Keep candidate with highest score for each web_id
-                    if doc_id not in web_id_to_best_chunk:
-                        web_id_to_best_chunk[doc_id] = candidate
-                    else:
-                        current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
-                        best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
-                        if current_score > best_score:
-                            web_id_to_best_chunk[doc_id] = candidate
-                except (ValueError, TypeError):
-                    continue
-            
-            # If we still need more, fill from original candidates
-            if len(web_id_to_best_chunk) < k_final:
-                for candidate in candidates:
+            try:
+                candidates = batch_candidates[local_idx] if local_idx < len(batch_candidates) else []
+                final_candidates = reranked_batch[local_idx] if local_idx < len(reranked_batch) else []
+                if not final_candidates:
+                    final_candidates = candidates[:k_final] if candidates else []
+                
+                # Deduplicate by web_id: keep best chunk per document
+                web_id_to_best_chunk = {}
+                for candidate in final_candidates:
                     try:
                         doc_id = int(candidate.get("doc_id", 0))
-                        if doc_id <= 0 or doc_id in web_id_to_best_chunk:
+                        if doc_id <= 0:
                             continue
-                        web_id_to_best_chunk[doc_id] = candidate
-                        if len(web_id_to_best_chunk) >= k_final:
-                            break
+                        # Keep candidate with highest score for each web_id
+                        if doc_id not in web_id_to_best_chunk:
+                            web_id_to_best_chunk[doc_id] = candidate
+                        else:
+                            current_score = float(candidate.get("score", candidate.get("rerank_score", 0.0)))
+                            best_score = float(web_id_to_best_chunk[doc_id].get("score", web_id_to_best_chunk[doc_id].get("rerank_score", 0.0)))
+                            if current_score > best_score:
+                                web_id_to_best_chunk[doc_id] = candidate
                     except (ValueError, TypeError):
                         continue
-            
-            # Sort by score and take top-k
-            deduped_candidates = sorted(
-                web_id_to_best_chunk.values(),
-                key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
-                reverse=True
-            )[:k_final]
-            
-            web_ids = [int(c["doc_id"]) for c in deduped_candidates]
-            # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
-            while len(web_ids) < k_final:
-                if web_ids:
-                    web_ids.append(web_ids[-1])  # Duplicate last
+                
+                # If we still need more, fill from original candidates
+                if len(web_id_to_best_chunk) < k_final:
+                    for candidate in candidates:
+                        try:
+                            doc_id = int(candidate.get("doc_id", 0))
+                            if doc_id <= 0 or doc_id in web_id_to_best_chunk:
+                                continue
+                            web_id_to_best_chunk[doc_id] = candidate
+                            if len(web_id_to_best_chunk) >= k_final:
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                
+                # Sort by score and take top-k
+                if web_id_to_best_chunk:
+                    deduped_candidates = sorted(
+                        web_id_to_best_chunk.values(),
+                        key=lambda c: float(c.get("score", c.get("rerank_score", 0.0))),
+                        reverse=True
+                    )[:k_final]
+                    web_ids = [int(c["doc_id"]) for c in deduped_candidates]
                 else:
-                    web_ids.append(1)  # Fallback
-            web_ids = web_ids[:k_final]
-            batch_results[q_id] = web_ids
+                    web_ids = []
+                
+                # Fill remaining slots if needed (shouldn't happen after dedup, but safety check)
+                while len(web_ids) < k_final:
+                    if web_ids:
+                        web_ids.append(web_ids[-1])  # Duplicate last
+                    else:
+                        web_ids.append(1)  # Fallback
+                web_ids = web_ids[:k_final]
+                batch_results[q_id] = web_ids
+            except Exception as e:
+                # If processing individual question fails, use fallback
+                logger.warning(f"Failed to process question {q_id}: {e}. Using fallback.")
+                batch_results[q_id] = [1] * k_final  # Fallback: all 1s
         
         return batch_results
     

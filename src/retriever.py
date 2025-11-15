@@ -197,17 +197,31 @@ class HybridRetriever:
                 # Empty query - use placeholder to avoid BM25 errors
                 prepared.append(" ")
                 continue
+            
+            original_query = query.strip()
+            
             # Apply numeric enhancement if enabled
             if self.enhance_numerics:
-                query = enhance_query_for_numerics(query)
+                try:
+                    query = enhance_query_for_numerics(original_query)
+                except Exception:
+                    query = original_query  # Fallback to original on error
+            
             # Normalize query to match corpus normalization
-            normalized = normalize_for_retrieval(query, mode=self.normalization_mode)
-            # Ensure normalized query is not empty
-            if not normalized or not normalized.strip():
+            try:
+                normalized = normalize_for_retrieval(query, mode=self.normalization_mode)
+            except Exception:
+                normalized = query  # Fallback to query if normalization fails
+            
+            # Ensure normalized query is not empty and has at least one character
+            if not normalized or not normalized.strip() or len(normalized.strip()) == 0:
                 # Fallback to original query if normalization removed everything
-                prepared.append(query.strip() if query.strip() else " ")
+                if original_query and original_query.strip():
+                    prepared.append(original_query.strip())
+                else:
+                    prepared.append(" ")  # Ultimate fallback
             else:
-                prepared.append(normalized)
+                prepared.append(normalized.strip())
         return prepared
 
     def _normalized_weights(self) -> Dict[str, float]:
